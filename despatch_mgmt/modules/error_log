@@ -1,0 +1,40 @@
+[24-Mar-2026 03:40:45 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Unknown column 'p.company_id' in 'on clause' in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php:153
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php(153): mysqli->query('SELECT p.*, v.v...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php on line 153
+[24-Mar-2026 03:42:18 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Unknown column 'p.company_id' in 'on clause' in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php:153
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php(153): mysqli->query('SELECT p.*, v.v...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php on line 153
+[24-Mar-2026 05:45:45 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Unknown column 'p.company_id' in 'on clause' in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php:153
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php(153): mysqli->query('SELECT p.*, v.v...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_purchase_orders.php on line 153
+[24-Mar-2026 06:18:21 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Unknown column 'vehicle_no' in 'order clause' in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_dashboard.php:113
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_dashboard.php(113): mysqli->query('SELECT * FROM f...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_dashboard.php on line 113
+[24-Mar-2026 11:40:06 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Column count doesn't match value count at row 1 in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php:149
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php(149): mysqli->query('INSERT INTO fle...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php on line 149
+[24-Mar-2026 11:43:19 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Column count doesn't match value count at row 1 in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php:149
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php(149): mysqli->query('INSERT INTO fle...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php on line 149
+[24-Mar-2026 11:45:11 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Column count doesn't match value count at row 1 in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php:149
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php(149): mysqli->query('INSERT INTO fle...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php on line 149
+[24-Mar-2026 13:45:48 UTC] PHP Fatal error:  Uncaught mysqli_sql_exception: Column count doesn't match value count at row 1 in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php:149
+Stack trace:
+#0 /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php(149): mysqli->query('INSERT INTO fle...')
+#1 {main}
+  thrown in /home/tsgimpex/public_html/despatch_mgmt/modules/fleet_customers_master.php on line 149
