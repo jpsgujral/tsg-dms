@@ -13,26 +13,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_status_change'])
         echo json_encode(['success' => false, 'message' => 'Invalid request']);
         exit;
     }
-    // Validate transition
     $row = $db->query("SELECT status FROM despatch_orders WHERE id=$id LIMIT 1")->fetch_assoc();
     if (!$row) { echo json_encode(['success' => false, 'message' => 'Order not found']); exit; }
     $valid = ($row['status'] === 'Despatched' && $new_status === 'In Transit')
           || ($row['status'] === 'In Transit'  && $new_status === 'Delivered');
     if (!$valid) { echo json_encode(['success' => false, 'message' => 'Invalid transition']); exit; }
-    $extra = "";
-    $db->query("UPDATE despatch_orders SET status='".($db->real_escape_string($new_status))."'$extra WHERE id=$id");
+    $db->query("UPDATE despatch_orders SET status='".($db->real_escape_string($new_status))."' WHERE id=$id");
     echo json_encode(['success' => true, 'new_status' => $new_status]);
     exit;
 }
 
+// ── Check if updated_at column exists, use safe fallback ──────────────────
+$dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+$has_updated_at = $db->query("SELECT 1 FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='despatch_orders'
+    AND COLUMN_NAME='updated_at' LIMIT 1")->num_rows > 0;
+
 // ── Today's stats ──────────────────────────────────────────────────────────
-$today_count = $db->query("SELECT COUNT(*) c FROM despatch_orders WHERE DATE(despatch_date)=CURDATE() AND status!='Cancelled'")->fetch_assoc()['c'] ?? 0;
-$today_mt    = $db->query("SELECT COALESCE(SUM(total_weight),0) w FROM despatch_orders WHERE DATE(despatch_date)=CURDATE() AND status!='Cancelled'")->fetch_assoc()['w'] ?? 0;
+$today_count   = $db->query("SELECT COUNT(*) c FROM despatch_orders WHERE DATE(despatch_date)=CURDATE() AND status!='Cancelled'")->fetch_assoc()['c'] ?? 0;
+$today_mt      = $db->query("SELECT COALESCE(SUM(total_weight),0) w FROM despatch_orders WHERE DATE(despatch_date)=CURDATE() AND status!='Cancelled'")->fetch_assoc()['w'] ?? 0;
 $transit_count = $db->query("SELECT COUNT(*) c FROM despatch_orders WHERE status='In Transit'")->fetch_assoc()['c'] ?? 0;
 $transit_mt    = $db->query("SELECT COALESCE(SUM(total_weight),0) w FROM despatch_orders WHERE status='In Transit'")->fetch_assoc()['w'] ?? 0;
 $po_pending    = $db->query("SELECT COUNT(*) c FROM purchase_orders WHERE status IN ('Draft','Approved')")->fetch_assoc()['c'] ?? 0;
 $month_freight = $db->query("SELECT COALESCE(SUM(freight_amount),0) f FROM despatch_orders WHERE MONTH(despatch_date)=MONTH(CURDATE()) AND YEAR(despatch_date)=YEAR(CURDATE()) AND status!='Cancelled'")->fetch_assoc()['f'] ?? 0;
-$delivered_today = $db->query("SELECT COUNT(*) c FROM despatch_orders WHERE status='Delivered' AND DATE(updated_at)=CURDATE()")->fetch_assoc()['c'] ?? 0;
+
+// Delivered today — use updated_at if available, else despatch_date as fallback
+if ($has_updated_at) {
+    $delivered_today = $db->query("SELECT COUNT(*) c FROM despatch_orders WHERE status='Delivered' AND DATE(updated_at)=CURDATE()")->fetch_assoc()['c'] ?? 0;
+} else {
+    $delivered_today = $db->query("SELECT COUNT(*) c FROM despatch_orders WHERE status='Delivered' AND DATE(despatch_date)=CURDATE()")->fetch_assoc()['c'] ?? 0;
+}
 
 // ── Last 7 days despatches ─────────────────────────────────────────────────
 $recent_despatches = $db->query("
@@ -53,8 +63,6 @@ include 'includes/header.php';
 
 <!-- ══ TOP STATS ROW ══════════════════════════════════════════════════════ -->
 <div class="row g-2 mb-3">
-
-    <!-- Today Despatched -->
     <div class="col-6 col-md-3">
         <div class="card border-0 shadow-sm h-100" style="border-left:4px solid #1a5632 !important">
             <div class="card-body py-2 px-3">
@@ -69,8 +77,6 @@ include 'includes/header.php';
             </div>
         </div>
     </div>
-
-    <!-- In Transit -->
     <div class="col-6 col-md-3">
         <div class="card border-0 shadow-sm h-100" style="border-left:4px solid #f39c12 !important">
             <div class="card-body py-2 px-3">
@@ -85,8 +91,6 @@ include 'includes/header.php';
             </div>
         </div>
     </div>
-
-    <!-- Delivered Today -->
     <div class="col-6 col-md-3">
         <div class="card border-0 shadow-sm h-100" style="border-left:4px solid #27ae60 !important">
             <div class="card-body py-2 px-3">
@@ -101,8 +105,6 @@ include 'includes/header.php';
             </div>
         </div>
     </div>
-
-    <!-- Pending POs + Quick Actions -->
     <div class="col-6 col-md-3">
         <div class="card border-0 shadow-sm h-100" style="border-left:4px solid #3498db !important">
             <div class="card-body py-2 px-3">
@@ -120,7 +122,6 @@ include 'includes/header.php';
             </div>
         </div>
     </div>
-
 </div>
 
 <!-- ══ LAST 7 DAYS DESPATCHES TABLE ══════════════════════════════════════ -->
@@ -131,7 +132,6 @@ include 'includes/header.php';
             <small class="text-muted fw-normal">— Last 7 days</small>
             <span class="badge bg-secondary ms-1"><?= count($recent_despatches) ?></span>
         </span>
-        <!-- Status Filter Buttons -->
         <div class="d-flex gap-1 flex-wrap" id="statusFilters">
             <button class="btn btn-sm btn-dark active" onclick="filterStatus('All',this)">All</button>
             <?php
@@ -145,7 +145,6 @@ include 'includes/header.php';
             <?php endforeach; ?>
         </div>
     </div>
-
     <div class="card-body p-0">
     <?php if (empty($recent_despatches)): ?>
         <div class="text-center text-muted p-4"><i class="bi bi-inbox me-2"></i>No despatches in last 7 days</div>
@@ -181,16 +180,14 @@ include 'includes/header.php';
                 <td style="font-size:.82rem"><?= htmlspecialchars($row['transporter_name'] ?? '—') ?></td>
                 <td class="text-end" style="font-size:.82rem"><?= (float)$row['total_weight'] > 0 ? number_format((float)$row['total_weight'], 3) : '—' ?></td>
                 <td class="text-end" style="font-size:.82rem"><?= (float)($row['freight_amount']??0) > 0 ? '₹'.number_format((float)$row['freight_amount'], 0) : '—' ?></td>
-                <td>
-                    <span class="badge bg-<?= $badges[$st] ?? 'secondary' ?> status-badge" style="font-size:.65rem"><?= $st ?></span>
-                </td>
+                <td><span class="badge bg-<?= $badges[$st] ?? 'secondary' ?> status-badge" style="font-size:.65rem"><?= $st ?></span></td>
                 <td>
                     <?php if ($st === 'Despatched'): ?>
-                        <button class="btn btn-warning btn-sm py-0 px-2" style="font-size:.7rem" onclick="changeStatus(<?= $id ?>,'In Transit',this)" title="Mark In Transit">
+                        <button class="btn btn-warning btn-sm py-0 px-2" style="font-size:.7rem" onclick="changeStatus(<?= $id ?>,'In Transit',this)">
                             <i class="bi bi-truck"></i> In Transit
                         </button>
                     <?php elseif ($st === 'In Transit'): ?>
-                        <button class="btn btn-success btn-sm py-0 px-2" style="font-size:.7rem" onclick="changeStatus(<?= $id ?>,'Delivered',this)" title="Mark Delivered">
+                        <button class="btn btn-success btn-sm py-0 px-2" style="font-size:.7rem" onclick="changeStatus(<?= $id ?>,'Delivered',this)">
                             <i class="bi bi-check-circle"></i> Delivered
                         </button>
                     <?php else: ?>
@@ -232,7 +229,6 @@ include 'includes/header.php';
 </style>
 
 <script>
-// ── Filter by status ────────────────────────────────────────────────────
 function filterStatus(status, btn) {
     document.querySelectorAll('#statusFilters .btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
@@ -241,7 +237,6 @@ function filterStatus(status, btn) {
     });
 }
 
-// ── Status change with confirm modal ───────────────────────────────────
 let _pendingId = null, _pendingStatus = null, _pendingBtn = null;
 
 function changeStatus(id, newStatus, btn) {
@@ -272,23 +267,18 @@ document.getElementById('statusModalConfirm').addEventListener('click', function
         .then(data => {
             if (data.success) {
                 const row = btn.closest('tr');
-                // Update status badge
-                const badges = {
-                    'Despatched':'primary','In Transit':'warning','Delivered':'success'
-                };
+                const badges = {'Despatched':'primary','In Transit':'warning','Delivered':'success'};
                 row.querySelector('.status-badge').className =
                     'badge bg-' + (badges[data.new_status] || 'secondary') + ' status-badge';
                 row.querySelector('.status-badge').textContent = data.new_status;
                 row.dataset.status = data.new_status;
-                // Update action button
                 const td = btn.parentElement;
                 if (data.new_status === 'In Transit') {
                     td.innerHTML = '<button class="btn btn-success btn-sm py-0 px-2" style="font-size:.7rem" onclick="changeStatus(' + _pendingId + ',\'Delivered\',this)"><i class="bi bi-check-circle"></i> Delivered</button>';
                 } else if (data.new_status === 'Delivered') {
                     td.innerHTML = '<a href="modules/despatch.php?action=edit&id=' + _pendingId + '" class="btn btn-outline-secondary btn-sm py-0 px-2" style="font-size:.7rem"><i class="bi bi-eye"></i> View</a>';
                 }
-                // Update top stats (simple page counter update)
-                updateTopStats(data.new_status);
+                setTimeout(() => location.reload(), 800);
             } else {
                 alert('Error: ' + data.message);
                 btn.disabled = false;
@@ -302,11 +292,6 @@ document.getElementById('statusModalConfirm').addEventListener('click', function
             btn.disabled = false;
         });
 });
-
-function updateTopStats(newStatus) {
-    // Refresh page after status change to update all counters accurately
-    setTimeout(() => location.reload(), 800);
-}
 </script>
 
 <?php include 'includes/footer.php'; ?>
