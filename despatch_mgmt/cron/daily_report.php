@@ -18,7 +18,7 @@
 /*  RECIPIENT EMAILS  */
 /* Add/remove emails here. The report will be sent to ALL of these. */
 $REPORT_RECIPIENTS = [
-    'sales@tsgimpex.com',
+    'support@tsgimpex.com',
     'tsgaccounts@tsgimpex.com',
 ];
 
