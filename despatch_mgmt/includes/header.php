@@ -363,14 +363,7 @@ $modules_base = $in_modules ? '' : 'modules/';
         .topbar { padding: 0 12px; }
     }
 
-    /* ═══════════════════════ STICKY TABLE HEADERS ══════════════ */
-    .table-responsive table thead th {
-        position: sticky;
-        top: 0;
-        z-index: 10;
-        background: #f5fbf7;
-        box-shadow: 0 1px 3px rgba(0,0,0,.08);
-    }
+
 
     /* ═══════════════════════ BOTTOM NAV BAR (mobile only) ═════ */
     .bottom-nav {
