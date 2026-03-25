@@ -304,6 +304,14 @@ $modules_base = $in_modules ? '' : 'modules/';
         .stat-card    { padding: 14px; }
         .stat-card h3 { font-size: 1.2rem; }
         .table td, .table th { font-size: 0.78rem; padding: 6px 8px; }
+        /* iOS Safari auto-zoom fix — inputs must be >= 16px on mobile */
+        .form-control, .form-select, textarea.form-control,
+        input[type="text"], input[type="number"], input[type="date"],
+        input[type="email"], input[type="tel"], input[type="search"] {
+            font-size: 16px !important;
+        }
+        /* Extra bottom padding so content clears bottom nav bar */
+        .content-area { padding-bottom: 72px; }
 
         /* Stack form cols */
         .row > [class*="col-md-"] { margin-bottom: 0; }
@@ -355,9 +363,63 @@ $modules_base = $in_modules ? '' : 'modules/';
         .topbar { padding: 0 12px; }
     }
 
+    /* ═══════════════════════ STICKY TABLE HEADERS ══════════════ */
+    .table-responsive table thead th {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: #f5fbf7;
+        box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    }
+
+    /* ═══════════════════════ BOTTOM NAV BAR (mobile only) ═════ */
+    .bottom-nav {
+        display: none;
+    }
+    @media (max-width: 991.98px) {
+        .bottom-nav {
+            display: flex;
+            position: fixed;
+            bottom: 0; left: 0; right: 0;
+            height: 58px;
+            background: #fff;
+            border-top: 1px solid #e0ede5;
+            box-shadow: 0 -2px 12px rgba(0,0,0,.08);
+            z-index: 1030;
+            align-items: stretch;
+            padding-bottom: env(safe-area-inset-bottom, 0px);
+        }
+        .bottom-nav a {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            color: #888;
+            text-decoration: none;
+            font-size: .6rem;
+            font-weight: 600;
+            letter-spacing: .3px;
+            text-transform: uppercase;
+            transition: color .15s, background .15s;
+            border-radius: 0;
+        }
+        .bottom-nav a i { font-size: 1.2rem; }
+        .bottom-nav a:hover,
+        .bottom-nav a.active { color: var(--primary); background: #f0f8f3; }
+        .bottom-nav a.add-btn {
+            color: #fff;
+            background: var(--primary);
+            border-radius: 0;
+        }
+        .bottom-nav a.add-btn:hover { background: var(--secondary); color: #fff; }
+        .bottom-nav a.add-btn i { font-size: 1.5rem; }
+    }
+
     /* ═══════════════════════ PRINT OVERRIDE ═══════════════════ */
     @media print {
-        .sidebar, .topbar, .sidebar-overlay { display: none !important; }
+        .sidebar, .topbar, .sidebar-overlay, .bottom-nav { display: none !important; }
         .main-content { margin-left: 0 !important; }
         .content-area { padding: 0 !important; }
     }
@@ -696,3 +758,42 @@ function closeSidebar() {
 
     <div class="content-area">
 <?php displayAlert(); ?>
+
+<!-- ── Bottom Nav Bar (mobile only) ───────────────────────── -->
+<nav class="bottom-nav">
+    <a href="<?= $base ?>index.php" class="<?= $current_page=='index.php'?'active':'' ?>">
+        <i class="bi bi-speedometer2"></i>Dashboard
+    </a>
+    <?php if (isAdmin() || canDo('despatch','view')): ?>
+    <a href="<?= $modules_base ?>despatch.php" class="<?= $current_page=='despatch.php'?'active':'' ?>">
+        <i class="bi bi-send-check"></i>Despatch
+    </a>
+    <?php endif; ?>
+    <?php if (isAdmin() || canDo('despatch','add')): ?>
+    <a href="<?= $modules_base ?>despatch.php?action=add" class="add-btn">
+        <i class="bi bi-plus-circle-fill"></i>New
+    </a>
+    <?php endif; ?>
+    <?php if (isAdmin() || canDo('purchase_orders','view')): ?>
+    <a href="<?= $modules_base ?>purchase_orders.php" class="<?= $current_page=='purchase_orders.php'?'active':'' ?>">
+        <i class="bi bi-file-earmark-text"></i>POs
+    </a>
+    <?php endif; ?>
+    <?php if (isAdmin() || canDo('delivery_challans','view')): ?>
+    <a href="<?= $modules_base ?>delivery_challans.php" class="<?= $current_page=='delivery_challans.php'?'active':'' ?>">
+        <i class="bi bi-receipt"></i>Challans
+    </a>
+    <?php endif; ?>
+</nav>
+
+<script>
+/* Auto-dismiss alerts after 4 seconds */
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('.alert.alert-dismissible').forEach(function(el) {
+        setTimeout(function() {
+            var bsAlert = bootstrap.Alert.getOrCreateInstance(el);
+            if (bsAlert) bsAlert.close();
+        }, 4000);
+    });
+});
+</script>

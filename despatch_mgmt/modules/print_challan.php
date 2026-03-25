@@ -355,18 +355,31 @@ function cleanAddress($str) {
             page-break-inside: avoid;
         }
 
-        /* Screen: scroll horizontally if challan wider than viewport */
+        /* ── Mobile screen ── */
         @media screen and (max-width: 800px) {
             body { background: #e5f5eb; }
             .challan-wrapper {
-                padding: 4mm 4mm;
+                padding: 3mm 2mm;
                 max-width: 100%;
                 overflow-x: auto;
             }
-            .print-controls { padding: 10px 12px; }
-            .print-controls button { padding: 8px 14px; font-size: 0.82rem; }
+            /* Bigger tap targets for buttons */
+            .print-controls { padding: 10px 8px; gap: 6px; }
+            .print-controls button {
+                padding: 10px 12px;
+                font-size: 0.78rem;
+                min-height: 44px;
+                border-radius: 8px;
+            }
+            /* Stack buttons on very small screens */
+            @media (max-width: 480px) {
+                .print-controls { flex-direction: column; align-items: stretch; }
+                .print-controls button { width: 100%; justify-content: center; }
+                .print-controls span { text-align: center; }
+            }
         }
 
+        /* ── Print ── */
         @media print {
             .print-controls { display: none !important; }
             body { margin: 0; background: white; }
