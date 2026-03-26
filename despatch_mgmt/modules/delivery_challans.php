@@ -129,6 +129,26 @@ include '../includes/header.php';
 .consignee-group-header:hover td { background: #d5e3f0 !important; }
 .group-row td { background: #fff; }
 .group-row:hover td { background: #f8f9fa !important; }
+
+/* ── Mobile improvements ── */
+@media (max-width: 575.98px) {
+    /* Stack filter buttons full width */
+    .btn-primary.btn-sm, .btn-outline-secondary.btn-sm {
+        width: 100%; margin-left: 0 !important; margin-top: 4px;
+    }
+    /* Larger print/edit tap targets */
+    .btn-action {
+        min-height: 38px; min-width: 38px;
+        display: inline-flex; align-items: center; justify-content: center;
+    }
+    /* Hide less important columns on small screens */
+    #challanTable thead tr th:nth-child(5),
+    #challanTable tbody tr td:nth-child(5) { display: none; } /* Transporter */
+    #challanTable thead tr th:nth-child(7),
+    #challanTable tbody tr td:nth-child(7) { display: none; } /* Amount */
+    /* Group header adjust */
+    .consignee-group-header td:first-child { font-size: .8rem; }
+}
 </style>
 <script>
 function toggleGroup(id, headerRow) {

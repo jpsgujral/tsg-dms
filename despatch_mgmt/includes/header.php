@@ -163,10 +163,10 @@ $modules_base = $in_modules ? '' : 'modules/';
 
     /* ═══════════════════════ TOPBAR ═══════════════════════════ */
     .topbar {
-        background: linear-gradient(135deg, var(--primary), #2d6b3f);
+        background: #fff;
         height: var(--topbar-h);
         padding: 0 20px;
-        box-shadow: 0 2px 12px rgba(0,0,0,.2);
+        box-shadow: 0 2px 12px rgba(0,0,0,.07);
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -176,14 +176,14 @@ $modules_base = $in_modules ? '' : 'modules/';
         flex-shrink: 0;
     }
     .topbar-left { display: flex; align-items: center; gap: 12px; }
-    .topbar h4  { margin: 0; font-size: 1rem; color: #fff; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw; }
+    .topbar h4  { margin: 0; font-size: 1rem; color: var(--primary); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw; }
 
     /* Hamburger toggle — hidden on desktop, visible on mobile */
     .sidebar-toggle {
         display: none;
-        background: rgba(255,255,255,.15);
+        background: none;
         border: none;
-        color: #fff;
+        color: var(--primary);
         font-size: 1.4rem;
         padding: 4px 6px;
         border-radius: 6px;
@@ -191,10 +191,10 @@ $modules_base = $in_modules ? '' : 'modules/';
         line-height: 1;
         flex-shrink: 0;
     }
-    .sidebar-toggle:hover { background: rgba(255,255,255,.25); }
+    .sidebar-toggle:hover { background: var(--light-bg); }
 
     .topbar-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-    .topbar-date  { font-size: 0.75rem; color: rgba(255,255,255,.75); }
+    .topbar-date  { font-size: 0.75rem; color: #888; }
 
     /* ═══════════════════════ CONTENT AREA ═════════════════════ */
     .content-area {
@@ -375,9 +375,9 @@ $modules_base = $in_modules ? '' : 'modules/';
             position: fixed;
             bottom: 0; left: 0; right: 0;
             height: 58px;
-            background: linear-gradient(135deg, var(--primary), #2d6b3f);
-            border-top: 2px solid rgba(255,255,255,.15);
-            box-shadow: 0 -3px 16px rgba(0,0,0,.25);
+            background: #fff;
+            border-top: 1px solid #e0ede5;
+            box-shadow: 0 -2px 12px rgba(0,0,0,.08);
             z-index: 1030;
             align-items: stretch;
             padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -389,7 +389,7 @@ $modules_base = $in_modules ? '' : 'modules/';
             align-items: center;
             justify-content: center;
             gap: 2px;
-            color: rgba(255,255,255,.65);
+            color: #888;
             text-decoration: none;
             font-size: .6rem;
             font-weight: 600;
@@ -397,22 +397,16 @@ $modules_base = $in_modules ? '' : 'modules/';
             text-transform: uppercase;
             transition: color .15s, background .15s;
             border-radius: 0;
-            border-right: 1px solid rgba(255,255,255,.1);
         }
-        .bottom-nav a:last-child { border-right: none; }
         .bottom-nav a i { font-size: 1.2rem; }
-        .bottom-nav a:hover { color: #fff; background: rgba(255,255,255,.1); }
-        .bottom-nav a.active {
-            color: #fff;
-            background: rgba(255,255,255,.15);
-            border-top: 3px solid #2ecc71;
-        }
+        .bottom-nav a:hover,
+        .bottom-nav a.active { color: var(--primary); background: #f0f8f3; }
         .bottom-nav a.add-btn {
             color: #fff;
-            background: #27ae60;
-            border-right: 1px solid rgba(255,255,255,.1);
+            background: var(--primary);
+            border-radius: 0;
         }
-        .bottom-nav a.add-btn:hover { background: #2ecc71; }
+        .bottom-nav a.add-btn:hover { background: var(--secondary); color: #fff; }
         .bottom-nav a.add-btn i { font-size: 1.5rem; }
     }
 
@@ -723,14 +717,14 @@ function closeSidebar() {
         <div class="topbar-right">
             <span class="topbar-date d-none d-sm-inline"><?= date('d M Y') ?></span>
             <div class="dropdown">
-                <button class="btn btn-sm d-flex align-items-center gap-2"
+                <button class="btn btn-sm btn-outline-secondary d-flex align-items-center gap-2"
                         type="button" data-bs-toggle="dropdown" aria-expanded="false"
-                        style="border-radius:20px;padding:4px 12px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff">
+                        style="border-radius:20px;padding:4px 12px">
                     <span class="d-flex align-items-center justify-content-center rounded-circle text-white fw-bold"
                           style="width:26px;height:26px;font-size:.75rem;background:linear-gradient(135deg,#1a5632,#27ae60)">
                         <?= strtoupper(substr($_SESSION['full_name']??$_SESSION['username']??'U',0,1)) ?>
                     </span>
-                    <span class="d-none d-md-inline" style="font-size:.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fff">
+                    <span class="d-none d-md-inline" style="font-size:.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
                         <?= htmlspecialchars($_SESSION['full_name'] ?? $_SESSION['username'] ?? 'User') ?>
                     </span>
                     <?php if (isAdmin()): ?><span class="badge bg-danger" style="font-size:.6rem">Admin</span><?php endif; ?>

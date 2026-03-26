@@ -208,19 +208,26 @@ include '../includes/header.php';
 <div class="card-body p-0">
 <div class="table-responsive">
 <table class="table table-hover datatable mb-0">
-    <thead><tr><th>#</th><th>Company</th><th>PO Number</th><th>Date</th><th>Vendor</th><th>Quantity</th><th>Unit Price</th><th>Actions</th></tr></thead>
+    <thead><tr><th>#</th><th>Company</th><th>PO Number</th><th>Date</th><th>Vendor</th><th>Status</th><th class="text-end">PO Qty</th><th class="text-end">Despatched</th><th class="text-end">Balance</th><th>Actions</th></tr></thead>
     <tbody>
     <?php
     $list = $db->query("SELECT p.*,v.vendor_name,c.company_name AS co_name,
         COALESCE((SELECT SUM(pi.qty) FROM po_items pi WHERE pi.po_id=p.id),0) AS total_qty,
-        CASE WHEN COALESCE((SELECT SUM(pi.qty) FROM po_items pi WHERE pi.po_id=p.id),0) > 0
-             THEN p.subtotal / (SELECT SUM(pi.qty) FROM po_items pi WHERE pi.po_id=p.id)
-             ELSE 0 END AS avg_unit_price
-        FROM purchase_orders p LEFT JOIN vendors v ON p.vendor_id=v.id LEFT JOIN companies c ON p.company_id=c.id ORDER BY c.company_name, p.po_date DESC, p.id DESC");
+        COALESCE((SELECT SUM(d.total_weight) FROM despatch_orders d WHERE d.po_id=p.id AND d.status NOT IN ('Cancelled','Draft')),0) AS despatched_qty
+        FROM purchase_orders p
+        LEFT JOIN vendors v ON p.vendor_id=v.id
+        LEFT JOIN companies c ON p.company_id=c.id
+        ORDER BY c.company_name, p.po_date DESC, p.id DESC");
     $i=1;
     while ($v=$list->fetch_assoc()):
-        $badge = ['Draft'=>'secondary','Approved'=>'success','Partially Received'=>'warning','Received'=>'info','Cancelled'=>'danger'];
-        $b = $badge[$v['status']] ?? 'secondary';
+        $badge  = ['Draft'=>'secondary','Approved'=>'success','Partially Received'=>'warning','Received'=>'info','Cancelled'=>'danger'];
+        $b      = $badge[$v['status']] ?? 'secondary';
+        $po_qty = (float)$v['total_qty'];
+        $desp   = (float)$v['despatched_qty'];
+        $bal    = max(0, $po_qty - $desp);
+        $pct    = $po_qty > 0 ? min(100, round(($desp / $po_qty) * 100)) : 0;
+        // Balance colour: green=plenty, orange=low(<20%), red=exhausted
+        $bal_class = $bal <= 0 ? 'text-danger fw-bold' : ($pct >= 80 ? 'text-warning fw-bold' : 'text-success fw-bold');
     ?>
     <tr>
         <td><?= $i++ ?></td>
@@ -228,8 +235,18 @@ include '../includes/header.php';
         <td><strong><?= htmlspecialchars($v['po_number']) ?></strong></td>
         <td><?= date('d/m/Y', strtotime($v['po_date'])) ?></td>
         <td><?= htmlspecialchars($v['vendor_name']) ?></td>
-        <td><?= number_format($v['total_qty'],2) ?></td>
-        <td>₹<?= number_format($v['avg_unit_price'],2) ?></td>
+        <td><span class="badge bg-<?= $b ?>"><?= htmlspecialchars($v['status']) ?></span></td>
+        <td class="text-end"><?= number_format($po_qty, 3) ?></td>
+        <td class="text-end"><?= number_format($desp, 3) ?></td>
+        <td class="text-end">
+            <span class="<?= $bal_class ?>"><?= number_format($bal, 3) ?></span>
+            <?php if ($po_qty > 0): ?>
+            <div class="progress mt-1" style="height:4px;min-width:60px">
+                <div class="progress-bar bg-<?= $pct>=100?'danger':($pct>=80?'warning':'success') ?>"
+                     style="width:<?= $pct ?>%"></div>
+            </div>
+            <?php endif; ?>
+        </td>
         <td>
             <a href="?action=view&id=<?= $v['id'] ?>" class="btn btn-action btn-outline-info me-1"><i class="bi bi-eye"></i></a>
             <a href="?action=edit&id=<?= $v['id'] ?>" class="btn btn-action btn-outline-primary me-1"><i class="bi bi-pencil"></i></a>
