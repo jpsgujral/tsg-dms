@@ -61,6 +61,7 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_trips (
 
 fleetSafeAddCol($db, 'fleet_trips', 'po_id',        'INT DEFAULT NULL');
 fleetSafeAddCol($db, 'fleet_trips', 'vendor_id',     'INT DEFAULT NULL');
+fleetSafeAddCol($db, 'fleet_trips', 'total_weight',  'DECIMAL(10,3) DEFAULT 0');
 fleetSafeAddCol($db, 'fleet_trips', 'subtotal',      'DECIMAL(12,2) DEFAULT 0');
 fleetSafeAddCol($db, 'fleet_trips', 'total_amount',  'DECIMAL(12,2) DEFAULT 0');
 fleetSafeAddCol($db, 'fleet_trips', 'mtc_required',  "ENUM('No','Yes') DEFAULT 'No'");
@@ -228,8 +229,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_trip'])) {
             customer_name='$cust_name', customer_address='$cust_addr',
             customer_city='$cust_city', customer_state='$cust_state', customer_gstin='$cust_gst',
             total_weight=$total_weight, uom='$uom',
-            start_odometer=$start_odo, end_odometer=$end_odo,
-            start_date=$start_sql, end_date=$end_sql,
             freight_amount=$freight, driver_advance=$advance,
             toll_amount=$toll, loading_charges=$loading, unloading_charges=$unloading,
             other_expenses=$other, subtotal=$subtotal, total_amount=$total_amount,
@@ -244,14 +243,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_trip'])) {
         $db->query("INSERT INTO fleet_trips
             (trip_no,trip_date,po_id,vendor_id,vehicle_id,driver_id,supervisor_id,
              from_location,to_location,customer_name,customer_address,customer_city,
-             customer_state,customer_gstin,total_weight,uom,start_odometer,end_odometer,
-             start_date,end_date,freight_amount,driver_advance,toll_amount,loading_charges,
+             customer_state,customer_gstin,total_weight,uom,
+             freight_amount,driver_advance,toll_amount,loading_charges,
              unloading_charges,other_expenses,subtotal,total_amount,
              mtc_required,mtc_source,mtc_item_name,mtc_test_date,mtc_ros_45,mtc_moisture,
              mtc_loi,mtc_fineness,mtc_remarks,company_id,status,remarks,created_by)
             VALUES ('$trip_no','$trip_date',$po_sql,$vend_sql,$veh_id,$drv_id,$sup_sql,
             '$from','$to','$cust_name','$cust_addr','$cust_city','$cust_state','$cust_gst',
-            $total_weight,'$uom',$start_odo,$end_odo,$start_sql,$end_sql,
+            $total_weight,'$uom',
             $freight,$advance,$toll,$loading,$unloading,$other,$subtotal,$total_amount,
             '$mtc_req','$mtc_src','$mtc_item',$mtc_tdate_sql,'$mtc_ros','$mtc_moist',
             '$mtc_loi','$mtc_fine','$mtc_rem',$co_id,'$status','$remarks',$uid)");
@@ -278,8 +277,17 @@ $pos       = $db->query("SELECT p.id,p.po_number,p.vendor_id,p.delivery_address 
 $items_list= $db->query("SELECT id,item_code,item_name,uom FROM items WHERE status='Active' ORDER BY item_name")->fetch_all(MYSQLI_ASSOC);
 $sources_list = $db->query("SELECT id,source_name FROM source_of_material WHERE status='Active' ORDER BY source_name")->fetch_all(MYSQLI_ASSOC);
 
-/* Vehicle → Driver map — empty by default, driver auto-fill via JS not supported without DB column */
+/* Vehicle → Driver map: use most recent trip per vehicle to suggest driver */
 $veh_driver_map = [];
+$vd_res = $db->query("SELECT vehicle_id, driver_id FROM fleet_trips
+    WHERE driver_id IS NOT NULL AND driver_id > 0
+    GROUP BY vehicle_id HAVING MAX(id)
+    ORDER BY MAX(id) DESC");
+if ($vd_res) while ($vdr = $vd_res->fetch_assoc()) {
+    if (!isset($veh_driver_map[$vdr['vehicle_id']])) {
+        $veh_driver_map[(int)$vdr['vehicle_id']] = (int)$vdr['driver_id'];
+    }
+}
 
 /* PO → vendor + delivery address + freight rate map */
 $po_vendor_map = [];
@@ -357,7 +365,7 @@ foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;
 <thead><tr>
     <th>Trip No</th><th>Date</th><?php if(count($all_companies)>1): ?><th>Company</th><?php endif; ?>
     <th>Customer PO</th><th>Customer</th><th>Vehicle</th><th>Driver</th>
-    <th>From → To</th><th class="text-end">Weight</th>
+    <th class="text-end">Weight</th>
     <th class="text-end">Freight</th><th>Status</th><th>Actions</th>
 </tr></thead>
 <tbody>
@@ -372,7 +380,6 @@ foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;
     <td><?= htmlspecialchars($t['vendor_name'] ?? $t['customer_name'] ?? '—') ?><br><small class="text-muted"><?= htmlspecialchars($t['customer_city']??'') ?></small></td>
     <td><span class="badge bg-dark"><?= htmlspecialchars($t['reg_no']) ?></span></td>
     <td><?= htmlspecialchars($t['driver_name']) ?></td>
-    <td><?= htmlspecialchars($t['from_location']) ?><br><small class="text-muted"><?= htmlspecialchars($t['to_location']) ?></small></td>
     <td class="text-end"><?= number_format($t['total_weight'],3) ?> MT</td>
     <td class="text-end">₹<?= number_format($t['freight_amount'],2) ?></td>
     <td><span class="badge bg-<?= $sc ?>"><?= $t['status'] ?></span></td>
@@ -454,15 +461,7 @@ $sc  = $status_colors[$t['status']] ?? 'secondary';
     <tr><td class="text-muted">From → To</td><td><?= htmlspecialchars($t['from_location']) ?> → <?= htmlspecialchars($t['to_location']) ?></td></tr>
     <tr><td class="text-muted">Driver Advance</td><td><strong class="text-warning">₹<?= number_format($t['driver_advance'],2) ?></strong></td></tr>
     <tr><td class="text-muted">Freight Amount</td><td><strong class="text-success">₹<?= number_format($t['freight_amount'],2) ?></strong></td></tr>
-</table></div></div></div>
-
-<div class="col-12 col-md-6"><div class="card h-100"><div class="card-header"><i class="bi bi-geo-alt me-2"></i>Consignee Details</div>
-<div class="card-body"><table class="table table-sm mb-0">
-    <tr><td class="text-muted" style="width:45%">Name</td><td><strong><?= htmlspecialchars($t['customer_name']) ?></strong></td></tr>
-    <tr><td class="text-muted">Address</td><td><?= htmlspecialchars($t['customer_address']??'—') ?></td></tr>
-    <tr><td class="text-muted">City / State</td><td><?= htmlspecialchars(trim(($t['customer_city']??'').' '.($t['customer_state']??''))) ?: '—' ?></td></tr>
-    <tr><td class="text-muted">GSTIN</td><td><?= htmlspecialchars($t['customer_gstin']??'—') ?></td></tr>
-    <tr><td class="text-muted">Total Weight</td><td><strong><?= number_format($t['total_weight'],3) ?> MT</strong></td></tr>
+    <tr><td class="text-muted">Total Weight</td><td><strong><?= number_format((float)($t['total_weight']??0),3) ?> MT</strong></td></tr>
 </table></div></div></div>
 
 <?php if ($trip_items): ?>
@@ -485,7 +484,7 @@ $sc  = $status_colors[$t['status']] ?? 'secondary';
 </tbody>
 <tfoot class="table-light"><tr>
     <td colspan="4" class="text-end fw-bold">Total</td>
-    <td class="text-end fw-bold"><?= number_format($t['total_weight'],3) ?> MT</td>
+    <td class="text-end fw-bold"><?= number_format((float)($t['total_weight']??0),3) ?> MT</td>
     <td></td>
     <td class="text-end fw-bold">₹<?= number_format($t['subtotal'],2) ?></td>
 </tr></tfoot>
@@ -565,6 +564,21 @@ if ($id > 0) {
         <label class="form-label">Trip No</label>
         <input type="text" class="form-control bg-light fw-bold text-success" value="<?= htmlspecialchars($t['trip_no']) ?>" readonly>
     </div>
+    <?php else:
+        // Peek next trip number without incrementing
+        $month = (int)date('m'); $year = (int)date('Y');
+        $fy_start = $month >= 4 ? $year : $year - 1;
+        $fy_label = ($fy_start % 100) . '-' . str_pad(($fy_start+1) % 100, 2, '0', STR_PAD_LEFT);
+        $prefix   = "TR/$fy_label/";
+        $last_tr  = $db->query("SELECT trip_no FROM fleet_trips WHERE trip_no LIKE '$prefix%' ORDER BY id DESC LIMIT 1")->fetch_assoc();
+        $next_num = $last_tr ? (int)substr($last_tr['trip_no'], strrpos($last_tr['trip_no'], '/') + 1) + 1 : 1;
+        $preview_trip_no = $prefix . str_pad($next_num, 4, '0', STR_PAD_LEFT);
+    ?>
+    <div class="col-6 col-md-2">
+        <label class="form-label">Trip No</label>
+        <input type="text" class="form-control bg-light fw-bold text-success" value="<?= htmlspecialchars($preview_trip_no) ?>" readonly>
+        <div class="form-text text-muted"><i class="bi bi-lock-fill me-1"></i>Auto-generated on save</div>
+    </div>
     <?php endif; ?>
     <div class="col-6 col-md-2">
         <label class="form-label fw-bold">Trip Date *</label>
@@ -642,7 +656,7 @@ if ($id > 0) {
     </div>
     <div class="col-6 col-md-3">
         <label class="form-label">Source of Material (From)</label>
-        <select name="from_location" id="fromLocation" class="form-select">
+        <select name="from_location" id="fromLocation" class="form-select" onchange="syncMTCFields()">
             <option value="">— Select Source —</option>
             <?php foreach ($sources_list as $src): ?>
             <option value="<?= htmlspecialchars($src['source_name']) ?>"
@@ -659,29 +673,12 @@ if ($id > 0) {
 </div></div></div></div>
 
 <!-- Consignee -->
-<div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-geo-alt me-2"></i>Consignee Details <small class="text-muted fw-normal">(auto-filled from Customer Ship-To)</small></div>
-<div class="card-body"><div class="row g-3">
-    <div class="col-12 col-md-4">
-        <label class="form-label fw-bold">Consignee Name</label>
-        <input type="text" name="customer_name" id="custName" class="form-control" value="<?= htmlspecialchars($t['customer_name']??'') ?>">
-    </div>
-    <div class="col-6 col-md-2">
-        <label class="form-label">GSTIN</label>
-        <input type="text" name="customer_gstin" id="custGst" class="form-control" value="<?= htmlspecialchars($t['customer_gstin']??'') ?>">
-    </div>
-    <div class="col-6 col-md-2">
-        <label class="form-label">City</label>
-        <input type="text" name="customer_city" id="custCity" class="form-control" value="<?= htmlspecialchars($t['customer_city']??'') ?>">
-    </div>
-    <div class="col-6 col-md-2">
-        <label class="form-label">State</label>
-        <input type="text" name="customer_state" id="custState" class="form-control" value="<?= htmlspecialchars($t['customer_state']??'') ?>">
-    </div>
-    <div class="col-12 col-md-6">
-        <label class="form-label">Address</label>
-        <textarea name="customer_address" id="custAddr" class="form-control" rows="2"><?= htmlspecialchars($t['customer_address']??'') ?></textarea>
-    </div>
-</div></div></div></div>
+<!-- Hidden consignee fields - auto-populated from vendor but not shown -->
+<input type="hidden" name="customer_name" id="custName" value="<?= htmlspecialchars($t['customer_name']??'') ?>">
+<input type="hidden" name="customer_gstin" id="custGst" value="<?= htmlspecialchars($t['customer_gstin']??'') ?>">
+<input type="hidden" name="customer_city" id="custCity" value="<?= htmlspecialchars($t['customer_city']??'') ?>">
+<input type="hidden" name="customer_state" id="custState" value="<?= htmlspecialchars($t['customer_state']??'') ?>">
+<input type="hidden" name="customer_address" id="custAddr" value="<?= htmlspecialchars($t['customer_address']??'') ?>">
 
 <!-- Items -->
 <div class="col-12"><div class="card"><div class="card-header d-flex justify-content-between align-items-center">
@@ -791,16 +788,31 @@ if ($id > 0) {
     </div>
     <div class="row g-3">
         <div class="col-12 col-md-4">
-            <label class="form-label">Source of Material</label>
-            <input type="text" name="mtc_source" class="form-control" value="<?= htmlspecialchars($t['mtc_source']??'') ?>">
+            <label class="form-label">Source of Material
+                <span class="badge bg-info text-dark ms-1" style="font-size:.65rem">
+                    <i class="bi bi-arrow-up-circle me-1"></i>Auto from Trip Info
+                </span>
+            </label>
+            <input type="text" name="mtc_source" id="mtcSource" class="form-control bg-light"
+                   readonly tabindex="-1" value="<?= htmlspecialchars($t['mtc_source']??'') ?>">
         </div>
         <div class="col-12 col-md-4">
-            <label class="form-label">Item Name</label>
-            <input type="text" name="mtc_item_name" class="form-control" value="<?= htmlspecialchars($t['mtc_item_name']??'') ?>">
+            <label class="form-label">Item Name
+                <span class="badge bg-info text-dark ms-1" style="font-size:.65rem">
+                    <i class="bi bi-arrow-up-circle me-1"></i>Auto from Items
+                </span>
+            </label>
+            <input type="text" name="mtc_item_name" id="mtcItemName" class="form-control bg-light"
+                   readonly tabindex="-1" value="<?= htmlspecialchars($t['mtc_item_name']??'') ?>">
         </div>
         <div class="col-12 col-md-2">
-            <label class="form-label">Test Date</label>
-            <input type="date" name="mtc_test_date" class="form-control" value="<?= htmlspecialchars($t['mtc_test_date']??date('Y-m-d')) ?>">
+            <label class="form-label">Test Date
+                <span class="badge bg-info text-dark ms-1" style="font-size:.65rem">
+                    <i class="bi bi-arrow-up-circle me-1"></i>= Trip Date
+                </span>
+            </label>
+            <input type="date" name="mtc_test_date" id="mtcTestDate" class="form-control bg-light"
+                   readonly tabindex="-1" value="<?= htmlspecialchars($t['mtc_test_date'] ?: ($t['trip_date'] ?? date('Y-m-d'))) ?>">
         </div>
     </div>
     <h6 class="fw-bold mt-3 mb-2 text-warning"><i class="bi bi-table me-1"></i>Test Results</h6>
@@ -908,9 +920,11 @@ function fillFromVendor(vid) {
 function fillDriverFromVehicle(vid) {
     vid = parseInt(vid) || 0;
     var did = vehDriverMap[vid] || 0;
-    if (did) {
-        var dSel = document.getElementById('driverSelect');
-        if (dSel) dSel.value = did;
+    var dSel = document.getElementById("driverSelect");
+    if (did && dSel) {
+        dSel.value = did;
+        dSel.style.background = "#f0f8f3";
+        dSel.title = "Auto-filled from last trip for this vehicle — change if needed";
     }
 }
 
@@ -924,6 +938,7 @@ function fillItemUom(sel) {
     var nameEl = tr.querySelector('.item-name-hidden');
     if (uomEl)  uomEl.value  = uom;
     if (nameEl) nameEl.value = name;
+    syncMTCFields();
 }
 
 /* ── Row calculations ── */
@@ -986,6 +1001,25 @@ function removeItemRow(btn) {
 function toggleMTC() {
     var yes = document.getElementById('mtcYes').checked;
     document.getElementById('mtcDetails').style.display = yes ? 'block' : 'none';
+    if (yes) syncMTCFields();
+}
+
+/* ── Sync MTC fields from Trip Info + Items ── */
+function syncMTCFields() {
+    // Source = From Location (source_of_material dropdown)
+    var fromSel = document.getElementById('fromLocation');
+    var srcEl   = document.getElementById('mtcSource');
+    if (fromSel && srcEl) srcEl.value = fromSel.options[fromSel.selectedIndex]?.text || '';
+
+    // Item Name = first selected item in items table
+    var firstItem = document.querySelector('.item-name-hidden');
+    var itemEl    = document.getElementById('mtcItemName');
+    if (firstItem && itemEl && firstItem.value) itemEl.value = firstItem.value;
+
+    // Test Date = Trip Date
+    var tripDate = document.querySelector('[name="trip_date"]');
+    var dateEl   = document.getElementById('mtcTestDate');
+    if (tripDate && dateEl && tripDate.value) dateEl.value = tripDate.value;
 }
 
 /* ── Init ── */
@@ -995,6 +1029,11 @@ window._poFreightRate = <?= (float)($po_rate_map[$t['po_id']] ?? 0) ?>;
 <?php endif; ?>
 calcItemsTotal();
 updateTotalWeight();
+syncMTCFields();
+
+// Re-sync MTC when trip date changes
+var tripDateEl = document.querySelector('[name="trip_date"]');
+if (tripDateEl) tripDateEl.addEventListener('change', syncMTCFields);
 </script>
 <?php endif; ?>
 <?php include '../includes/footer.php'; ?>

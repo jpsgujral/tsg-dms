@@ -3,6 +3,9 @@ require_once '../includes/config.php';
 require_once '../includes/r2_helper.php';
 
 /* ── Resolve image path: local uploads/ → relative URL, R2 key → r2_url() ── */
+/* Fix double-encoded entities from sanitize() */
+function esc($v) { return htmlspecialchars(html_entity_decode((string)($v??''), ENT_QUOTES|ENT_HTML5, 'UTF-8'), ENT_QUOTES, 'UTF-8'); }
+
 function img_display_url(string $path): string {
     if (empty($path)) return '';
     if (strpos($path, 'uploads/') === 0) {
@@ -66,9 +69,9 @@ function cleanAddress($str) {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Delivery Challan - <?= htmlspecialchars($despatch['challan_no']) ?></title>
+    <title>Delivery Challan - <?= esc($despatch['challan_no']) ?></title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; color-adjust: exact !important; }
         body {
             font-family: Arial, sans-serif;
             font-size: 10pt;
@@ -355,31 +358,18 @@ function cleanAddress($str) {
             page-break-inside: avoid;
         }
 
-        /* ── Mobile screen ── */
+        /* Screen: scroll horizontally if challan wider than viewport */
         @media screen and (max-width: 800px) {
             body { background: #e5f5eb; }
             .challan-wrapper {
-                padding: 3mm 2mm;
+                padding: 4mm 4mm;
                 max-width: 100%;
                 overflow-x: auto;
             }
-            /* Bigger tap targets for buttons */
-            .print-controls { padding: 10px 8px; gap: 6px; }
-            .print-controls button {
-                padding: 10px 12px;
-                font-size: 0.78rem;
-                min-height: 44px;
-                border-radius: 8px;
-            }
-            /* Stack buttons on very small screens */
-            @media (max-width: 480px) {
-                .print-controls { flex-direction: column; align-items: stretch; }
-                .print-controls button { width: 100%; justify-content: center; }
-                .print-controls span { text-align: center; }
-            }
+            .print-controls { padding: 10px 12px; }
+            .print-controls button { padding: 8px 14px; font-size: 0.82rem; }
         }
 
-        /* ── Print ── */
         @media print {
             .print-controls { display: none !important; }
             body { margin: 0; background: white; }
@@ -400,7 +390,7 @@ function cleanAddress($str) {
 <body>
 
 <div class="print-controls">
-    <span>📄 Challan: <strong><?= htmlspecialchars($despatch['challan_no']) ?></strong></span>
+    <span>📄 Challan: <strong><?= esc($despatch['challan_no']) ?></strong></span>
     <button onclick="window.print()">🖨️ Print All 3 Copies</button>
     <button class="pdf-btn" onclick="window.open('export_challan_pdf.php?id=<?= $id ?>', '_blank')">📄 View PDF</button>
     <button class="dl-btn"  onclick="window.location='export_challan_pdf.php?id=<?= $id ?>&download'">⬇️ Download PDF</button>
@@ -418,24 +408,24 @@ foreach ($copies as $idx => $copyLabel):
     <div class="challan-header">
         <div class="header-top">
             <div>
-                <div class="company-name"><?= htmlspecialchars($company['company_name']) ?></div>
+                <div class="company-name"><?= esc($company['company_name']) ?></div>
                 <div class="company-tagline">
-                    <?= htmlspecialchars($company['address']) ?>, <?= htmlspecialchars($company['city']) ?>
-                    <?= $company['state'] ? ', '.$company['state'] : '' ?> - <?= htmlspecialchars($company['pincode']) ?><br>
-                    📞 <?= htmlspecialchars($company['phone']) ?> | ✉ <?= htmlspecialchars($company['email']) ?><br>
-                    GSTIN: <?= htmlspecialchars($company['gstin']) ?> | PAN: <?= htmlspecialchars($company['pan']) ?>
+                    <?= esc($company['address']) ?>, <?= esc($company['city']) ?>
+                    <?= $company['state'] ? ', '.$company['state'] : '' ?> - <?= esc($company['pincode']) ?><br>
+                    📞 <?= esc($company['phone']) ?> | ✉ <?= esc($company['email']) ?><br>
+                    GSTIN: <?= esc($company['gstin']) ?> | PAN: <?= esc($company['pan']) ?>
                 </div>
             </div>
             <div class="challan-title">
                 <h2>Delivery Challan</h2>
-                <p>Challan No: <strong><?= htmlspecialchars($despatch['challan_no']) ?></strong><br>
+                <p>Challan No: <strong><?= esc($despatch['challan_no']) ?></strong><br>
                 Date: <strong><?= date('d/m/Y', strtotime($despatch['despatch_date'])) ?></strong></p>
             </div>
         </div>
         <div class="header-info">
             <div class="company-details">
                 <?php if ($despatch['vendor_name']): ?>
-                Vendor/Consignor: <strong><?= htmlspecialchars($despatch['vendor_name']) ?></strong>
+                Vendor/Consignor: <strong><?= esc($despatch['vendor_name']) ?></strong>
                 <?php endif; ?>
             </div>
             <div class="challan-meta">
@@ -453,7 +443,7 @@ foreach ($copies as $idx => $copyLabel):
                     $wt_uom = !empty($items[0]['uom']) ? $items[0]['uom'] : (!empty($items[0]['i_uom']) ? $items[0]['i_uom'] : 'Kg');
                     $wt_dp  = uomDecimals($wt_uom);
                     ?>
-                    <span class="meta-value"><?= $is_draft ? '—' : number_format((float)($despatch['total_weight']??0), $wt_dp).' '.htmlspecialchars($wt_uom) ?></span>
+                    <span class="meta-value"><?= $is_draft ? '—' : number_format((float)($despatch['total_weight']??0), $wt_dp).' '.esc($wt_uom) ?></span>
                 </div>
 
                 <?php if (!empty($despatch['expected_delivery'])): ?>
@@ -472,36 +462,36 @@ foreach ($copies as $idx => $copyLabel):
     <div class="address-section">
         <div class="address-box">
             <div class="box-title">Consignee (Ship To)</div>
-            <strong><?= htmlspecialchars(cleanAddress($despatch['consignee_name'])) ?></strong>
-            <?= htmlspecialchars(cleanAddress($despatch['consignee_address'])) ?><br>
-            <?= htmlspecialchars(cleanAddress($despatch['consignee_city'])) ?>
-            <?= $despatch['consignee_state'] ? ', '.htmlspecialchars(cleanAddress($despatch['consignee_state'])) : '' ?>
-            <?= $despatch['consignee_pincode'] ? ' - '.htmlspecialchars(cleanAddress($despatch['consignee_pincode'])) : '' ?><br>
-            <?php if ($despatch['consignee_gstin']): ?>GSTIN: <strong><?= htmlspecialchars(cleanAddress($despatch['consignee_gstin'])) ?></strong><?php endif; ?>
+            <strong><?= esc(cleanAddress($despatch['consignee_name'])) ?></strong>
+            <?= esc(cleanAddress($despatch['consignee_address'])) ?><br>
+            <?= esc(cleanAddress($despatch['consignee_city'])) ?>
+            <?= $despatch['consignee_state'] ? ', '.esc(cleanAddress($despatch['consignee_state'])) : '' ?>
+            <?= $despatch['consignee_pincode'] ? ' - '.esc(cleanAddress($despatch['consignee_pincode'])) : '' ?><br>
+            <?php if ($despatch['consignee_gstin']): ?>GSTIN: <strong><?= esc(cleanAddress($despatch['consignee_gstin'])) ?></strong><?php endif; ?>
         </div>
         <div class="address-box">
             <div class="box-title">PO &amp; Transporter Details</div>
-            <?php if ($despatch['po_number']): ?><strong>PO No: <?= htmlspecialchars($despatch['po_number']) ?></strong><br><?php endif; ?>
+            <?php if ($despatch['po_number']): ?><strong>PO No: <?= esc($despatch['po_number']) ?></strong><br><?php endif; ?>
             <?php if ($despatch['transporter_code']): ?>
-            Transporter: <strong><?= htmlspecialchars($despatch['transporter_code']) ?></strong><br>
+            Transporter: <strong><?= esc($despatch['transporter_code']) ?></strong><br>
             <?php else: ?>
             <em style="color:#999">Self Transport / Direct</em><br>
             <?php endif; ?>
-            <?php if ($despatch['lr_number']): ?>LR No: <strong><?= htmlspecialchars($despatch['lr_number']) ?></strong><?php endif; ?>
+            <?php if ($despatch['lr_number']): ?>LR No: <strong><?= esc($despatch['lr_number']) ?></strong><?php endif; ?>
             <?php if ($despatch['lr_date']): ?> | LR Date: <?= date('d/m/Y', strtotime($despatch['lr_date'])) ?><?php endif; ?>
         </div>
         <div class="address-box" style="border-right:none">
             <div class="box-title">Vehicle & Driver</div>
             <?php if ($despatch['vehicle_no']): ?>
-            Vehicle No: <strong><?= htmlspecialchars($despatch['vehicle_no']) ?></strong><br>
+            Vehicle No: <strong><?= esc($despatch['vehicle_no']) ?></strong><br>
             <?php endif; ?>
             <?php if ($despatch['driver_name']): ?>
-            Driver: <strong><?= htmlspecialchars($despatch['driver_name']) ?></strong><br>
+            Driver: <strong><?= esc($despatch['driver_name']) ?></strong><br>
             <?php endif; ?>
             <?php if ($despatch['driver_mobile']): ?>
-            Mobile: <?= htmlspecialchars($despatch['driver_mobile']) ?><br>
+            Mobile: <?= esc($despatch['driver_mobile']) ?><br>
             <?php endif; ?>
-            Freight: <strong><?= htmlspecialchars($despatch['freight_paid_by']) ?> Pay</strong>
+            Freight: <strong><?= esc($despatch['freight_paid_by']) ?> Pay</strong>
         </div>
     </div>
 
@@ -536,13 +526,13 @@ foreach ($copies as $idx => $copyLabel):
         ?>
         <tr>
             <td class="num"><?= $idx2+1 ?></td>
-            <td><?= htmlspecialchars($item['item_code']) ?></td>
+            <td><?= esc($item['item_code']) ?></td>
             <td>
-                <strong><?= htmlspecialchars($item['item_name']) ?></strong>
-                <?php if ($item['description']): ?><br><span style="font-size:7.5pt;color:#666"><?= htmlspecialchars($item['description']) ?></span><?php endif; ?>
+                <strong><?= esc($item['item_name']) ?></strong>
+                <?php if ($item['description']): ?><br><span style="font-size:7.5pt;color:#666"><?= esc($item['description']) ?></span><?php endif; ?>
             </td>
-            <td class="num"><?= htmlspecialchars($item['hsn_code']) ?></td>
-            <td class="num"><?= htmlspecialchars($item['uom'] ?: $item['i_uom']) ?></td>
+            <td class="num"><?= esc($item['hsn_code']) ?></td>
+            <td class="num"><?= esc($item['uom'] ?: $item['i_uom']) ?></td>
             <td class="num"><?= ((float)($item['qty']??0) > 0) ? number_format((float)$item['qty'], $item_dp) : '—' ?></td>
             <td class="num"><strong><?= $is_draft ? '—' : (((float)($item['weight']??0) > 0) ? number_format((float)$item['weight'], 3) : '—') ?></strong></td>
             <td class="right"><?= $is_draft ? '—' : '₹'.number_format((float)($item['unit_price']??0),2) ?></td>
@@ -606,7 +596,7 @@ foreach ($copies as $idx => $copyLabel):
         <div class="sig-box">
             <div class="sig-title">Prepared By</div>
             <?php if (!empty($despatch['prepared_by_name'])): ?>
-            <div style="margin-top:4px;font-size:8pt;font-weight:600;color:#1a5632"><?= htmlspecialchars($despatch['prepared_by_name']) ?></div>
+            <div style="margin-top:4px;font-size:8pt;font-weight:600;color:#1a5632"><?= esc($despatch['prepared_by_name']) ?></div>
             <?php endif; ?>
         </div>
         <div class="sig-box">
@@ -631,13 +621,13 @@ foreach ($copies as $idx => $copyLabel):
                      style="max-height:45px;max-width:90%;object-fit:contain">
             </div>
             <?php endif; ?>
-            <div class="sig-title">Authorised Signatory<br>For <?= htmlspecialchars($company['company_name']) ?></div>
+            <div class="sig-title">Authorised Signatory<br>For <?= esc($company['company_name']) ?></div>
         </div>
     </div>
 
     <div class="challan-footer">
-        This is a computer generated Delivery Challan | <?= htmlspecialchars($company['company_name']) ?> | 
-        GSTIN: <?= htmlspecialchars($company['gstin']) ?> | Generated on: <?= date('d/m/Y H:i:s') ?>
+        This is a computer generated Delivery Challan | <?= esc($company['company_name']) ?> | 
+        GSTIN: <?= esc($company['gstin']) ?> | Generated on: <?= date('d/m/Y H:i:s') ?>
     </div>
 </div>
 
@@ -664,15 +654,15 @@ foreach ($copies as $idx => $copyLabel):
         <tr>
             <td style="width:25%;border:2px solid #333;padding:8px;text-align:center;vertical-align:middle">
                 <?php if (!empty($company['logo'])): ?>
-                <img src="<?= htmlspecialchars($company['logo']) ?>" style="max-height:50px">
+                <img src="<?= esc($company['logo']) ?>" style="max-height:50px">
                 <?php else: ?>
                 <div style="font-size:18px;font-weight:900;color:#1a5632"><?= strtoupper(substr($company['company_name'],0,3)) ?></div>
                 <?php endif; ?>
             </td>
             <td style="border:2px solid #333;padding:8px;text-align:center;vertical-align:middle">
                 <div style="font-size:14px;font-weight:700;letter-spacing:1px">MATERIAL TEST CERTIFICATE (MTC)</div>
-                <div style="font-size:10px;color:#555;margin-top:3px"><?= htmlspecialchars($company['company_name']) ?></div>
-                <div style="font-size:10px;color:#555"><?= htmlspecialchars($company['address']) ?>, <?= htmlspecialchars($company['city']) ?><?= $company['state']?', '.$company['state']:'' ?> | GSTIN: <?= htmlspecialchars($company['gstin']) ?></div>
+                <div style="font-size:10px;color:#555;margin-top:3px"><?= esc($company['company_name']) ?></div>
+                <div style="font-size:10px;color:#555"><?= esc($company['address']) ?>, <?= esc($company['city']) ?><?= $company['state']?', '.$company['state']:'' ?> | GSTIN: <?= esc($company['gstin']) ?></div>
             </td>
         </tr>
     </table>
@@ -681,19 +671,19 @@ foreach ($copies as $idx => $copyLabel):
     <table class="mtc-info-table" style="margin-top:0">
         <tr>
             <td class="lbl">Challan No &amp; Vehicle No.</td>
-            <td><?= htmlspecialchars($despatch['challan_no']) ?> &nbsp;|&nbsp; <?= htmlspecialchars($despatch['vehicle_no']) ?></td>
+            <td><?= esc($despatch['challan_no']) ?> &nbsp;|&nbsp; <?= esc($despatch['vehicle_no']) ?></td>
             <td class="lbl">Despatch Date</td>
             <td><?= date('d/m/Y', strtotime($despatch['despatch_date'])) ?></td>
         </tr>
         <tr>
             <td class="lbl">Item Name</td>
-            <td><?= htmlspecialchars($despatch['mtc_item_name'] ?: ($despatch['consignee_name'] ?? '-')) ?></td>
+            <td><?= esc($despatch['mtc_item_name'] ?: ($despatch['consignee_name'] ?? '-')) ?></td>
             <td class="lbl">Test Date</td>
             <td><?= $despatch['mtc_test_date'] ? date('d/m/Y', strtotime($despatch['mtc_test_date'])) : '-' ?></td>
         </tr>
         <tr>
             <td class="lbl">Vendor Name</td>
-            <td colspan="3"><?= htmlspecialchars($despatch['vendor_name'] ?? '-') ?></td>
+            <td colspan="3"><?= esc($despatch['vendor_name'] ?? '-') ?></td>
         </tr>
     </table>
 
@@ -702,7 +692,7 @@ foreach ($copies as $idx => $copyLabel):
         <tr>
             <td colspan="4" style="background:#fff8e1;padding:7px 8px;border:1px solid #999;font-size:10.5px">
                 Six random samples of Fly Ash were collected at one hour interval &amp; average results are as under:&nbsp;&nbsp;
-                <strong>Source: <?= htmlspecialchars($despatch['mtc_source'] ?? '-') ?></strong>
+                <strong>Source: <?= esc($despatch['mtc_source'] ?? '-') ?></strong>
             </td>
         </tr>
     </table>
@@ -719,29 +709,29 @@ foreach ($copies as $idx => $copyLabel):
         <tbody>
         <tr>
             <td class="test-name">ROS 45 Micron Sieve</td>
-            <td><?= htmlspecialchars($despatch['mtc_ros_45'] ?: '-') ?>%</td>
+            <td><?= esc($despatch['mtc_ros_45'] ?: '-') ?>%</td>
             <td>&lt; 34%</td>
         </tr>
         <tr>
             <td class="test-name">Moisture</td>
-            <td><?= htmlspecialchars($despatch['mtc_moisture'] ?: '-') ?>%</td>
+            <td><?= esc($despatch['mtc_moisture'] ?: '-') ?>%</td>
             <td>&lt; 2%</td>
         </tr>
         <tr>
             <td class="test-name">Loss on Ignition</td>
-            <td><?= htmlspecialchars($despatch['mtc_loi'] ?: '-') ?>%</td>
+            <td><?= esc($despatch['mtc_loi'] ?: '-') ?>%</td>
             <td>&lt; 5%</td>
         </tr>
         <tr>
             <td class="test-name">Fineness – Specific Surface Area by Blaine's Permeability Method</td>
-            <td><?= htmlspecialchars($despatch['mtc_fineness'] ?: '-') ?> m²/kg</td>
+            <td><?= esc($despatch['mtc_fineness'] ?: '-') ?> m²/kg</td>
             <td>&gt; 320 m²/kg</td>
         </tr>
         </tbody>
     </table>
 
     <?php if (!empty($despatch['mtc_remarks'])): ?>
-    <div style="margin-top:8px;font-size:11px"><strong>Remarks:</strong> <?= htmlspecialchars($despatch['mtc_remarks']) ?></div>
+    <div style="margin-top:8px;font-size:11px"><strong>Remarks:</strong> <?= esc($despatch['mtc_remarks']) ?></div>
     <?php endif; ?>
 
     <!-- Signatures -->
@@ -754,7 +744,7 @@ foreach ($copies as $idx => $copyLabel):
                      style="max-height:52px;max-width:100%;object-fit:contain">
                 <?php endif; ?>
             </div>
-            <div style="font-size:10px;font-weight:600">For <?= htmlspecialchars($company['company_name']) ?></div>
+            <div style="font-size:10px;font-weight:600">For <?= esc($company['company_name']) ?></div>
             <div style="font-size:10px;color:#555">(Manager Technical)</div>
         </div>
         <div class="mtc-sig-box">
@@ -772,7 +762,7 @@ foreach ($copies as $idx => $copyLabel):
     </div>
 
     <div style="text-align:center;margin-top:10px;font-size:9px;color:#888;border-top:1px solid #ddd;padding-top:5px">
-        This MTC is issued as per IS 3812 requirements | Attached to Delivery Challan: <strong><?= htmlspecialchars($despatch['challan_no']) ?></strong> | Original – Consignee Copy
+        This MTC is issued as per IS 3812 requirements | Attached to Delivery Challan: <strong><?= esc($despatch['challan_no']) ?></strong> | Original – Consignee Copy
     </div>
 </div>
 </div>
