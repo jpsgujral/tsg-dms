@@ -462,13 +462,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 $agent = $db->query("SELECT full_name, is_agent, slab1_upto, slab1_pct, slab2_pct
                     FROM app_users WHERE id=$agent_id AND is_agent=1")->fetch_assoc();
                 if ($agent) {
-                    $weight = (float)$data['total_weight'];
+                    // Use actual received weight from items (not $data['total_weight'] which may be stale)
+                    $weight = array_sum(array_column($valid_items, 'weight'));
+                    if ($weight <= 0) {
+                        // Fallback: fetch from DB if already saved
+                        $wt_row = $db->query("SELECT total_weight FROM despatch_orders WHERE id=$id")->fetch_assoc();
+                        $weight = (float)($wt_row['total_weight'] ?? 0);
+                    }
                     // Vendor rate = PO unit price for this despatch's PO
                     $vendor_rate = 0;
                     $po_id_comm  = (int)$data['po_id'];
                     $v_id        = (int)$data['vendor_id'];
                     if ($po_id_comm > 0) {
-                        // Get unit_price from PO items (first item's price as rate)
                         $po_rate_row = $db->query("SELECT unit_price FROM po_items
                             WHERE po_id=$po_id_comm LIMIT 1")->fetch_assoc();
                         $vendor_rate = (float)($po_rate_row['unit_price'] ?? 0);
@@ -489,14 +494,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $vendor_name   = $db->real_escape_string($data['consignee_name'] ?? '');
                     $challan_no    = $db->real_escape_string($data['challan_no'] ?? '');
                     if (empty($challan_no) && $id > 0) {
-                        // For existing records, fetch challan_no from DB
                         $cn_row = $db->query("SELECT challan_no, despatch_date FROM despatch_orders WHERE id=$id")->fetch_assoc();
                         $challan_no = $db->real_escape_string($cn_row['challan_no'] ?? '');
                         $data['despatch_date'] = $data['despatch_date'] ?: ($cn_row['despatch_date'] ?? '');
                     }
                     $desp_date     = $data['despatch_date'] ?? null;
                     $desp_date_sql = $desp_date ? "'".$db->real_escape_string($desp_date)."'" : 'NULL';
-                    // Upsert commission record
                     $db->query("INSERT INTO agent_commissions
                         (despatch_id, agent_id, challan_no, despatch_date, vendor_name,
                          received_weight, vendor_rate, transporter_rate, profit_per_mt,
@@ -512,6 +515,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             profit_per_mt=$profit_per_mt, slab_applied=$slab,
                             commission_pct=$pct, commission_amt=$comm_amt,
                             status=IF(status='Paid','Paid','Pending')");
+                }
+            } else {
+                $db->query("DELETE FROM agent_commissions WHERE despatch_id=$id AND status='Pending'");
+            }
+        } else {
+            $db->query("DELETE FROM agent_commissions WHERE despatch_id=$id AND status='Pending'");
+            $db->query("UPDATE despatch_orders SET total_weight=0, subtotal=0, gst_amount=0, total_amount=0 WHERE id=$id");
+            $db->query("UPDATE despatch_items SET weight=0, unit_price=0, gst_rate=0, gst_amount=0, total_price=0 WHERE despatch_id=$id");
+
                 }
             } else {
                 // Agent removed or not set — remove any pending commission for this despatch
@@ -793,19 +805,16 @@ document.addEventListener('DOMContentLoaded', function(){
         <?php else: ?>
         <input type="hidden" name="company_id" value="<?= activeCompanyId() ?>">
         <?php endif; ?>
-        <div class="col-6 col-sm-4 col-md-3">
+        <div class="col-8 col-sm-5 col-md-3">
             <label class="form-label">Challan No cum LR No</label>
-            <div class="input-group">
-                <span class="input-group-text bg-success text-white"><i class="bi bi-receipt"></i></span>
-                <input type="text" class="form-control bg-light fw-bold text-success"
-                       value="<?= htmlspecialchars($chl_no) ?>" readonly tabindex="-1"
-                       style="letter-spacing:0.5px">
-            </div>
+            <input type="text" class="form-control bg-light fw-bold text-success"
+                   value="<?= htmlspecialchars($chl_no) ?>" readonly tabindex="-1"
+                   style="letter-spacing:0.5px">
             <?php if ($action == 'add'): ?>
             <div class="form-text text-muted"><i class="bi bi-lock-fill me-1"></i>Auto-generated on save</div>
             <?php endif; ?>
         </div>
-        <div class="col-6 col-sm-4 col-md-2">
+        <div class="col-4 col-sm-3 col-md-2">
             <label class="form-label">Despatch Date *</label>
             <input type="date" name="despatch_date" id="despatch_date" class="form-control" value="<?= $despatch_date_val ?>" required>
         </div>
@@ -1883,6 +1892,21 @@ function bindMTCSyncListeners() {
 /* ── Show/hide delivery docs section based on status ── */
 function onStatusChange(sel) {
     var delivered = sel.value === 'Delivered';
+
+    // ── Issue 1 fix: warn if trying to set Delivered with no received weight ──
+    if (delivered) {
+        var weights = document.querySelectorAll('#dItemsBody [name="weight[]"]');
+        var totalWt = 0;
+        weights.forEach(function(w) { totalWt += parseFloat(w.value) || 0; });
+        if (totalWt <= 0) {
+            alert('⚠️ Cannot set status to Delivered — Received Weight is 0.\n\nPlease enter Received Weight for all items first.');
+            sel.value = sel.dataset.prev || 'In Transit';
+            return;
+        }
+    }
+    // Remember previous value for reverting
+    sel.dataset.prev = sel.value;
+
     var sec = document.getElementById('deliveryDocsSection');
     if (sec) sec.style.display = delivered ? 'block' : 'none';
     var fiSec = document.getElementById('freightInvoiceSection');
@@ -1974,6 +1998,7 @@ document.addEventListener('DOMContentLoaded', function() {
     var statusSel = document.querySelector('[name="status"]');
     if (statusSel) {
         statusSel.addEventListener('change', function() { onStatusChange(this); });
+        statusSel.dataset.prev = statusSel.value; // store initial value
         onStatusChange(statusSel); // run on load
     }
     toggleHardCopy();

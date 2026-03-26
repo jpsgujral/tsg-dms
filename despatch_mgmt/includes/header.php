@@ -163,10 +163,10 @@ $modules_base = $in_modules ? '' : 'modules/';
 
     /* ═══════════════════════ TOPBAR ═══════════════════════════ */
     .topbar {
-        background: #fff;
+        background: linear-gradient(135deg, var(--primary), #2d6b3f);
         height: var(--topbar-h);
         padding: 0 20px;
-        box-shadow: 0 2px 12px rgba(0,0,0,.07);
+        box-shadow: 0 2px 12px rgba(0,0,0,.2);
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -176,14 +176,14 @@ $modules_base = $in_modules ? '' : 'modules/';
         flex-shrink: 0;
     }
     .topbar-left { display: flex; align-items: center; gap: 12px; }
-    .topbar h4  { margin: 0; font-size: 1rem; color: var(--primary); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw; }
+    .topbar h4  { margin: 0; font-size: 1rem; color: #fff; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw; }
 
     /* Hamburger toggle — hidden on desktop, visible on mobile */
     .sidebar-toggle {
         display: none;
-        background: none;
+        background: rgba(255,255,255,.15);
         border: none;
-        color: var(--primary);
+        color: #fff;
         font-size: 1.4rem;
         padding: 4px 6px;
         border-radius: 6px;
@@ -191,10 +191,10 @@ $modules_base = $in_modules ? '' : 'modules/';
         line-height: 1;
         flex-shrink: 0;
     }
-    .sidebar-toggle:hover { background: var(--light-bg); }
+    .sidebar-toggle:hover { background: rgba(255,255,255,.25); }
 
     .topbar-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-    .topbar-date  { font-size: 0.75rem; color: #888; }
+    .topbar-date  { font-size: 0.75rem; color: rgba(255,255,255,.75); }
 
     /* ═══════════════════════ CONTENT AREA ═════════════════════ */
     .content-area {
@@ -304,6 +304,14 @@ $modules_base = $in_modules ? '' : 'modules/';
         .stat-card    { padding: 14px; }
         .stat-card h3 { font-size: 1.2rem; }
         .table td, .table th { font-size: 0.78rem; padding: 6px 8px; }
+        /* iOS Safari auto-zoom fix — inputs must be >= 16px on mobile */
+        .form-control, .form-select, textarea.form-control,
+        input[type="text"], input[type="number"], input[type="date"],
+        input[type="email"], input[type="tel"], input[type="search"] {
+            font-size: 16px !important;
+        }
+        /* Extra bottom padding so content clears bottom nav bar */
+        .content-area { padding-bottom: 72px; }
 
         /* Stack form cols */
         .row > [class*="col-md-"] { margin-bottom: 0; }
@@ -355,9 +363,62 @@ $modules_base = $in_modules ? '' : 'modules/';
         .topbar { padding: 0 12px; }
     }
 
+
+
+    /* ═══════════════════════ BOTTOM NAV BAR (mobile only) ═════ */
+    .bottom-nav {
+        display: none;
+    }
+    @media (max-width: 991.98px) {
+        .bottom-nav {
+            display: flex;
+            position: fixed;
+            bottom: 0; left: 0; right: 0;
+            height: 58px;
+            background: linear-gradient(135deg, var(--primary), #2d6b3f);
+            border-top: 2px solid rgba(255,255,255,.15);
+            box-shadow: 0 -3px 16px rgba(0,0,0,.25);
+            z-index: 1030;
+            align-items: stretch;
+            padding-bottom: env(safe-area-inset-bottom, 0px);
+        }
+        .bottom-nav a {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            color: rgba(255,255,255,.65);
+            text-decoration: none;
+            font-size: .6rem;
+            font-weight: 600;
+            letter-spacing: .3px;
+            text-transform: uppercase;
+            transition: color .15s, background .15s;
+            border-radius: 0;
+            border-right: 1px solid rgba(255,255,255,.1);
+        }
+        .bottom-nav a:last-child { border-right: none; }
+        .bottom-nav a i { font-size: 1.2rem; }
+        .bottom-nav a:hover { color: #fff; background: rgba(255,255,255,.1); }
+        .bottom-nav a.active {
+            color: #fff;
+            background: rgba(255,255,255,.15);
+            border-top: 3px solid #2ecc71;
+        }
+        .bottom-nav a.add-btn {
+            color: #fff;
+            background: #27ae60;
+            border-right: 1px solid rgba(255,255,255,.1);
+        }
+        .bottom-nav a.add-btn:hover { background: #2ecc71; }
+        .bottom-nav a.add-btn i { font-size: 1.5rem; }
+    }
+
     /* ═══════════════════════ PRINT OVERRIDE ═══════════════════ */
     @media print {
-        .sidebar, .topbar, .sidebar-overlay { display: none !important; }
+        .sidebar, .topbar, .sidebar-overlay, .bottom-nav { display: none !important; }
         .main-content { margin-left: 0 !important; }
         .content-area { padding: 0 !important; }
     }
@@ -662,14 +723,14 @@ function closeSidebar() {
         <div class="topbar-right">
             <span class="topbar-date d-none d-sm-inline"><?= date('d M Y') ?></span>
             <div class="dropdown">
-                <button class="btn btn-sm btn-outline-secondary d-flex align-items-center gap-2"
+                <button class="btn btn-sm d-flex align-items-center gap-2"
                         type="button" data-bs-toggle="dropdown" aria-expanded="false"
-                        style="border-radius:20px;padding:4px 12px">
+                        style="border-radius:20px;padding:4px 12px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff">
                     <span class="d-flex align-items-center justify-content-center rounded-circle text-white fw-bold"
                           style="width:26px;height:26px;font-size:.75rem;background:linear-gradient(135deg,#1a5632,#27ae60)">
                         <?= strtoupper(substr($_SESSION['full_name']??$_SESSION['username']??'U',0,1)) ?>
                     </span>
-                    <span class="d-none d-md-inline" style="font-size:.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                    <span class="d-none d-md-inline" style="font-size:.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fff">
                         <?= htmlspecialchars($_SESSION['full_name'] ?? $_SESSION['username'] ?? 'User') ?>
                     </span>
                     <?php if (isAdmin()): ?><span class="badge bg-danger" style="font-size:.6rem">Admin</span><?php endif; ?>
@@ -696,3 +757,42 @@ function closeSidebar() {
 
     <div class="content-area">
 <?php displayAlert(); ?>
+
+<!-- ── Bottom Nav Bar (mobile only) ───────────────────────── -->
+<nav class="bottom-nav">
+    <a href="<?= $base ?>index.php" class="<?= $current_page=='index.php'?'active':'' ?>">
+        <i class="bi bi-speedometer2"></i>Dashboard
+    </a>
+    <?php if (isAdmin() || canDo('despatch','view')): ?>
+    <a href="<?= $modules_base ?>despatch.php" class="<?= $current_page=='despatch.php'?'active':'' ?>">
+        <i class="bi bi-send-check"></i>Despatch
+    </a>
+    <?php endif; ?>
+    <?php if (isAdmin() || canDo('despatch','add')): ?>
+    <a href="<?= $modules_base ?>despatch.php?action=add" class="add-btn">
+        <i class="bi bi-plus-circle-fill"></i>New
+    </a>
+    <?php endif; ?>
+    <?php if (isAdmin() || canDo('purchase_orders','view')): ?>
+    <a href="<?= $modules_base ?>purchase_orders.php" class="<?= $current_page=='purchase_orders.php'?'active':'' ?>">
+        <i class="bi bi-file-earmark-text"></i>POs
+    </a>
+    <?php endif; ?>
+    <?php if (isAdmin() || canDo('delivery_challans','view')): ?>
+    <a href="<?= $modules_base ?>delivery_challans.php" class="<?= $current_page=='delivery_challans.php'?'active':'' ?>">
+        <i class="bi bi-receipt"></i>Challans
+    </a>
+    <?php endif; ?>
+</nav>
+
+<script>
+/* Auto-dismiss alerts after 4 seconds */
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('.alert.alert-dismissible').forEach(function(el) {
+        setTimeout(function() {
+            var bsAlert = bootstrap.Alert.getOrCreateInstance(el);
+            if (bsAlert) bsAlert.close();
+        }, 4000);
+    });
+});
+</script>

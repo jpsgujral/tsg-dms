@@ -28,7 +28,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['full_name']  = $user['full_name'];
             $_SESSION['role']       = $user['role'];
             $_SESSION['perms']      = json_decode($user['permissions'] ?? '{}', true) ?: [];
-            // Update last login
             $db->query("UPDATE app_users SET last_login=NOW() WHERE id={$user['id']}");
             header('Location: index.php'); exit;
         } else {
@@ -51,7 +50,7 @@ $app_name = $company['company_name'] ?? APP_NAME;
 <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
 <style>
 body {
-    background: linear-gradient(135deg, #1e3a5f 0%, #2c5f8a 50%, #1a7a6e 100%);
+    background: linear-gradient(135deg, #0e3320 0%, #1a5632 50%, #2d6b3f 100%);
     min-height: 100vh;
     display: flex;
     align-items: center;
@@ -61,10 +60,11 @@ body {
 .login-card {
     background: #fff;
     border-radius: 20px;
-    box-shadow: 0 24px 64px rgba(0,0,0,0.28);
+    box-shadow: 0 24px 64px rgba(0,0,0,0.35);
     width: 100%;
     max-width: 420px;
     padding: 40px 36px 32px;
+    margin: 16px;
 }
 .login-brand {
     text-align: center;
@@ -72,26 +72,26 @@ body {
 }
 .login-brand .icon-wrap {
     width: 68px; height: 68px;
-    background: linear-gradient(135deg, #1e3a5f, #2980b9);
+    background: linear-gradient(135deg, #1a5632, #27ae60);
     border-radius: 18px;
     display: flex; align-items: center; justify-content: center;
     margin: 0 auto 14px;
-    box-shadow: 0 8px 24px rgba(30,58,95,0.3);
+    box-shadow: 0 8px 24px rgba(26,86,50,0.4);
 }
 .login-brand .icon-wrap i { color: #fff; font-size: 2rem; }
-.login-brand h4 { font-weight: 800; color: #1e3a5f; margin: 0; font-size: 1.15rem; }
+.login-brand h4 { font-weight: 800; color: #1a5632; margin: 0; font-size: 1.15rem; }
 .login-brand p  { color: #888; font-size: 0.82rem; margin: 4px 0 0; }
 .form-label { font-weight: 600; font-size: 0.83rem; color: #444; }
 .form-control {
     border-radius: 10px;
-    border: 1.5px solid #dde4f0;
+    border: 1.5px solid #d0e8d8;
     font-size: 0.9rem;
     padding: 10px 14px;
     min-height: 44px;
 }
-.form-control:focus { border-color: #2980b9; box-shadow: 0 0 0 3px rgba(41,128,185,.15); }
+.form-control:focus { border-color: #27ae60; box-shadow: 0 0 0 3px rgba(39,174,96,.15); outline: none; }
 .btn-login {
-    background: linear-gradient(135deg, #1e3a5f, #2980b9);
+    background: linear-gradient(135deg, #1a5632, #27ae60);
     border: none; color: #fff;
     width: 100%; padding: 12px;
     border-radius: 10px; font-weight: 700;
@@ -101,17 +101,32 @@ body {
 }
 .btn-login:hover { opacity: .9; transform: translateY(-1px); color: #fff; }
 .input-group-text {
-    background: #f4f7fb;
-    border: 1.5px solid #dde4f0;
+    background: #f0f8f3;
+    border: 1.5px solid #d0e8d8;
     border-right: none;
     border-radius: 10px 0 0 10px;
-    color: #888;
+    color: #1a5632;
 }
 .input-group .form-control { border-left: none; border-radius: 0 10px 10px 0; }
 .input-group .form-control:focus { border-left: none; }
-.toggle-pw { cursor: pointer; background: #f4f7fb; border: 1.5px solid #dde4f0; border-left: none; border-radius: 0 10px 10px 0; color: #888; padding: 0 12px; }
-.toggle-pw:hover { color: #1e3a5f; }
+.toggle-pw {
+    cursor: pointer;
+    background: #f0f8f3;
+    border: 1.5px solid #d0e8d8;
+    border-left: none;
+    border-radius: 0 10px 10px 0;
+    color: #1a5632;
+    padding: 0 12px;
+}
+.toggle-pw:hover { color: #27ae60; }
 .footer-note { text-align: center; color: #aaa; font-size: 0.75rem; margin-top: 20px; }
+
+/* Mobile tweaks */
+@media (max-width: 480px) {
+    .login-card { padding: 28px 20px 24px; }
+    .login-brand .icon-wrap { width: 58px; height: 58px; }
+    .login-brand .icon-wrap i { font-size: 1.6rem; }
+}
 </style>
 </head>
 <body>
@@ -147,7 +162,9 @@ body {
                 </button>
             </div>
         </div>
-        <button type="submit" class="btn-login"><i class="bi bi-box-arrow-in-right me-2"></i>Sign In</button>
+        <button type="submit" class="btn-login">
+            <i class="bi bi-box-arrow-in-right me-2"></i>Sign In
+        </button>
     </form>
     <div class="footer-note">© <?= date('Y') ?> <?= htmlspecialchars($app_name) ?></div>
 </div>
