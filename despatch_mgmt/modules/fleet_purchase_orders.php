@@ -13,7 +13,9 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_purchase_orders (
     validity_date   DATE DEFAULT NULL,
     delivery_address TEXT,
     payment_terms   VARCHAR(120) DEFAULT '',
+    gst_type        ENUM('IGST','CGST+SGST') DEFAULT 'IGST',
     subtotal        DECIMAL(12,2) DEFAULT 0,
+    gst_amount      DECIMAL(12,2) DEFAULT 0,
     total_amount    DECIMAL(12,2) DEFAULT 0,
     status          ENUM('Draft','Approved','Partially Received','Received','Cancelled') DEFAULT 'Draft',
     company_id      INT DEFAULT 1,
@@ -26,12 +28,44 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_po_items (
     id          INT AUTO_INCREMENT PRIMARY KEY,
     po_id       INT NOT NULL,
     item_name   VARCHAR(200) NOT NULL,
-    description VARCHAR(200) DEFAULT '',
     uom         VARCHAR(20) DEFAULT 'MT',
     qty         DECIMAL(12,3) DEFAULT 0,
     unit_price  DECIMAL(12,2) DEFAULT 0,
+    gst_rate    DECIMAL(5,2) DEFAULT 0,
+    gst_amount  DECIMAL(12,2) DEFAULT 0,
     amount      DECIMAL(12,2) DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+/* ── Auto-migrate: add gst_type, gst_amount to fleet_purchase_orders ── */
+(function($db){
+    $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+    $cols = $db->query("SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_purchase_orders'")->fetch_all(MYSQLI_ASSOC);
+    $existing = array_column($cols, 'COLUMN_NAME');
+    if (!in_array('gst_type',   $existing)) $db->query("ALTER TABLE fleet_purchase_orders ADD COLUMN gst_type ENUM('IGST','CGST+SGST') DEFAULT 'IGST' AFTER payment_terms");
+    if (!in_array('gst_amount', $existing)) $db->query("ALTER TABLE fleet_purchase_orders ADD COLUMN gst_amount DECIMAL(12,2) DEFAULT 0 AFTER subtotal");
+})($db);
+
+/* ── Auto-migrate: add gst_rate, gst_amount to fleet_po_items, drop description ── */
+(function($db){
+    $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+    $cols = $db->query("SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_po_items'")->fetch_all(MYSQLI_ASSOC);
+    $existing = array_column($cols, 'COLUMN_NAME');
+    if (!in_array('gst_rate',   $existing)) $db->query("ALTER TABLE fleet_po_items ADD COLUMN gst_rate DECIMAL(5,2) DEFAULT 0 AFTER unit_price");
+    if (!in_array('gst_amount', $existing)) $db->query("ALTER TABLE fleet_po_items ADD COLUMN gst_amount DECIMAL(12,2) DEFAULT 0 AFTER gst_rate");
+    // Drop description column if exists (no longer needed)
+    if (in_array('description', $existing)) $db->query("ALTER TABLE fleet_po_items DROP COLUMN description");
+})($db);
+
+/* ── Add company_id if upgrading ── */
+(function($db){
+    $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+    $exists = $db->query("SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_purchase_orders'
+        AND COLUMN_NAME='company_id' LIMIT 1")->num_rows;
+    if (!$exists) $db->query("ALTER TABLE fleet_purchase_orders ADD COLUMN company_id INT DEFAULT 1");
+})($db);
 
 /* ── PO number generator (FY-aware) ── */
 function generateFleetPONo($db) {
@@ -71,41 +105,53 @@ if (isset($_GET['delete']) && isAdmin()) {
 /* ── Save ── */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_po'])) {
     requirePerm('fleet_purchase_orders', $id > 0 ? 'update' : 'create');
-    $po_no    = $id > 0 ? sanitize($_POST['po_number']) : generateFleetPONo($db);
+    $po_no    = sanitize($_POST['po_number'] ?? '');
     $po_date  = sanitize($_POST['po_date']);
+    if (!$po_no) {
+        showAlert('danger', 'PO Number is required.');
+        redirect("fleet_purchase_orders.php?action=".($id>0?"edit&id=$id":'add'));
+    }
     $vend_id  = (int)$_POST['vendor_id'];
     $val_date = sanitize($_POST['validity_date'] ?? '');
     $del_addr = sanitize($_POST['delivery_address'] ?? '');
     $pay_terms= sanitize($_POST['payment_terms'] ?? '');
+    $gst_type = in_array($_POST['gst_type'] ?? '', ['IGST','CGST+SGST']) ? $_POST['gst_type'] : 'IGST';
     $status   = sanitize($_POST['status'] ?? 'Draft');
     $remarks  = sanitize($_POST['remarks'] ?? '');
     $co_id    = (int)($_POST['company_id'] ?? activeCompanyId());
     $val_sql  = $val_date ? "'$val_date'" : 'NULL';
 
     $item_names = $_POST['item_name']  ?? [];
-    $item_descs = $_POST['item_desc']  ?? [];
     $item_uoms  = $_POST['item_uom']   ?? [];
     $item_qtys  = $_POST['item_qty']   ?? [];
     $item_prices= $_POST['item_price'] ?? [];
+    $item_gsts  = $_POST['item_gst']   ?? [];
 
-    $subtotal = 0;
+    $subtotal  = 0;
+    $gst_total = 0;
     $valid_items = [];
     foreach ($item_names as $idx => $iname) {
         $iname = trim($iname);
         if (!$iname) continue;
-        $qty   = (float)($item_qtys[$idx]   ?? 0);
-        $price = (float)($item_prices[$idx] ?? 0);
-        $amt   = round($qty * $price, 2);
-        $subtotal += $amt;
+        $qty      = (float)($item_qtys[$idx]   ?? 0);
+        $price    = (float)($item_prices[$idx] ?? 0);
+        $gst_rate = (float)($item_gsts[$idx]   ?? 0);
+        $base     = round($qty * $price, 2);
+        $gst_amt  = round($base * $gst_rate / 100, 2);
+        $amt      = $base + $gst_amt;
+        $subtotal  += $base;
+        $gst_total += $gst_amt;
         $valid_items[] = [
-            'item_name'  => $db->real_escape_string($iname),
-            'description'=> $db->real_escape_string($item_descs[$idx] ?? ''),
-            'uom'        => $db->real_escape_string($item_uoms[$idx] ?? 'MT'),
-            'qty'        => $qty,
-            'unit_price' => $price,
-            'amount'     => $amt,
+            'item_name' => $db->real_escape_string($iname),
+            'uom'       => $db->real_escape_string($item_uoms[$idx] ?? 'MT'),
+            'qty'       => $qty,
+            'unit_price'=> $price,
+            'gst_rate'  => $gst_rate,
+            'gst_amount'=> $gst_amt,
+            'amount'    => $amt,
         ];
     }
+    $grand_total = $subtotal + $gst_total;
 
     if (!$po_date || !$vend_id) {
         showAlert('danger', 'PO Date and Customer are required.');
@@ -114,32 +160,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_po'])) {
 
     if ($id > 0) {
         $db->query("UPDATE fleet_purchase_orders SET
-            po_date='$po_date', vendor_id=$vend_id, validity_date=$val_sql,
-            delivery_address='$del_addr', payment_terms='$pay_terms',
-            subtotal=$subtotal, total_amount=$subtotal, status='$status', remarks='$remarks'
+            po_number='$po_no', po_date='$po_date', vendor_id=$vend_id, validity_date=$val_sql,
+            delivery_address='$del_addr', payment_terms='$pay_terms', gst_type='$gst_type',
+            subtotal=$subtotal, gst_amount=$gst_total, total_amount=$grand_total,
+            status='$status', remarks='$remarks'
             WHERE id=$id");
         $db->query("DELETE FROM fleet_po_items WHERE po_id=$id");
     } else {
         $uid = (int)($_SESSION['user_id'] ?? 0);
         $db->query("INSERT INTO fleet_purchase_orders
-            (po_number,po_date,vendor_id,validity_date,delivery_address,payment_terms,
-             subtotal,total_amount,status,remarks,created_by)
-            VALUES ('$po_no','$po_date',$vend_id,$val_sql,'$del_addr','$pay_terms',
-            $subtotal,$subtotal,'$status','$remarks',$uid)");
+            (po_number,po_date,vendor_id,validity_date,delivery_address,payment_terms,gst_type,
+             subtotal,gst_amount,total_amount,status,remarks,created_by,company_id)
+            VALUES ('$po_no','$po_date',$vend_id,$val_sql,'$del_addr','$pay_terms','$gst_type',
+            $subtotal,$gst_total,$grand_total,'$status','$remarks',$uid,$co_id)");
         $id = $db->insert_id;
     }
 
     foreach ($valid_items as $row) {
-        $db->query("INSERT INTO fleet_po_items (po_id,item_name,description,uom,qty,unit_price,amount)
-            VALUES ($id,'{$row['item_name']}','{$row['description']}','{$row['uom']}',
-            {$row['qty']},{$row['unit_price']},{$row['amount']})");
+        $db->query("INSERT INTO fleet_po_items (po_id,item_name,uom,qty,unit_price,gst_rate,gst_amount,amount)
+            VALUES ($id,'{$row['item_name']}','{$row['uom']}',
+            {$row['qty']},{$row['unit_price']},{$row['gst_rate']},{$row['gst_amount']},{$row['amount']})");
     }
 
     showAlert('success', $id > 0 ? 'PO updated.' : 'PO created.');
     redirect('fleet_purchase_orders.php?action=view&id='.$id);
 }
 
-$vendors = $db->query("SELECT id,vendor_name FROM fleet_customers_master WHERE status='Active' ORDER BY vendor_name")->fetch_all(MYSQLI_ASSOC);
+/* ── Load customer data for JS auto-fill ── */
+$vendors_raw = $db->query("SELECT id, vendor_name, ship_address, ship_city, ship_state, ship_pincode,
+    ship_name, ship_gstin FROM fleet_customers_master WHERE status='Active' ORDER BY vendor_name")->fetch_all(MYSQLI_ASSOC);
+$vendors = $vendors_raw;
+
+/* ── Load items master for JS auto-fill ── */
+$items_master = $db->query("SELECT id, item_name, uom FROM items WHERE status='Active' ORDER BY item_name")->fetch_all(MYSQLI_ASSOC);
+
 $all_companies = getAllCompanies();
 
 include '../includes/header.php';
@@ -153,7 +207,13 @@ if ($action === 'list'):
 $pos = $db->query("SELECT p.*, v.vendor_name, co.company_name FROM fleet_purchase_orders p
     LEFT JOIN fleet_customers_master v ON p.vendor_id=v.id
     LEFT JOIN companies co ON p.company_id=co.id
-    ORDER BY p.po_date DESC, p.id DESC")->fetch_all(MYSQLI_ASSOC);
+    ORDER BY co.company_name ASC, p.po_date DESC, p.id DESC")->fetch_all(MYSQLI_ASSOC);
+
+$grouped = [];
+foreach ($pos as $p) {
+    $key = $p['company_name'] ?? 'Unassigned';
+    $grouped[$key][] = $p;
+}
 $counts = [];
 foreach ($pos as $p) $counts[$p['status']] = ($counts[$p['status']] ?? 0) + 1;
 ?>
@@ -163,7 +223,6 @@ foreach ($pos as $p) $counts[$p['status']] = ($counts[$p['status']] ?? 0) + 1;
     <a href="?action=add" class="btn btn-primary"><i class="bi bi-plus-circle me-1"></i>New PO</a>
     <?php endif; ?>
 </div>
-<!-- Filter -->
 <div class="card mb-3">
 <div class="card-body py-2 d-flex gap-1 flex-wrap">
     <button class="btn btn-sm btn-dark fpo-filter active" data-status="All" onclick="fpoFilter('All',this)">All <span class="badge bg-secondary ms-1"><?= count($pos) ?></span></button>
@@ -174,21 +233,31 @@ foreach ($pos as $p) $counts[$p['status']] = ($counts[$p['status']] ?? 0) + 1;
     <?php endforeach; ?>
 </div>
 </div>
-<div class="card"><div class="card-body p-0">
+
+<?php foreach ($grouped as $companyName => $list):
+    $grpTotal = array_sum(array_column($list, 'total_amount'));
+?>
+<div class="card mb-3">
+<div class="card-header d-flex justify-content-between align-items-center py-2">
+    <span><i class="bi bi-buildings me-2"></i><strong><?= htmlspecialchars($companyName) ?></strong>
+        <span class="badge bg-secondary ms-2"><?= count($list) ?> PO<?= count($list)>1?'s':'' ?></span>
+    </span>
+    <span class="text-white fw-semibold">₹<?= number_format($grpTotal,2) ?></span>
+</div>
+<div class="card-body p-0">
 <div class="table-responsive">
-<table class="table table-hover mb-0" id="fpoTable">
+<table class="table table-hover mb-0 fpo-table">
 <thead><tr>
-    <th>PO No</th><th>Date</th><th>Company</th><th>Customer / Buyer</th><th>Payment Terms</th>
+    <th>PO No</th><th>Date</th><th>Customer / Buyer</th><th>Payment Terms</th>
     <th class="text-end">Amount</th><th>Status</th><th>Actions</th>
 </tr></thead>
 <tbody>
-<?php foreach ($pos as $p):
+<?php foreach ($list as $p):
     $sc = $status_colors[$p['status']] ?? 'secondary';
 ?>
 <tr data-status="<?= $p['status'] ?>">
     <td><strong><?= htmlspecialchars($p['po_number']) ?></strong></td>
     <td><?= date('d/m/Y', strtotime($p['po_date'])) ?></td>
-    <td><?php if (count($all_companies)>1): ?><span class='badge bg-primary' style='font-size:.7rem'><?= htmlspecialchars($p['company_name']??'-') ?></span><?php else: ?>—<?php endif; ?></td>
     <td><?= htmlspecialchars($p['vendor_name'] ?? '—') ?></td>
     <td><?= htmlspecialchars($p['payment_terms'] ?: '—') ?></td>
     <td class="text-end">₹<?= number_format($p['total_amount'], 2) ?></td>
@@ -207,13 +276,20 @@ foreach ($pos as $p) $counts[$p['status']] = ($counts[$p['status']] ?? 0) + 1;
 </tbody>
 </table>
 </div></div></div>
+<?php endforeach; ?>
+
 <style>.fpo-filter.active{box-shadow:0 0 0 2px rgba(30,58,95,.5)}</style>
 <script>
 function fpoFilter(status, btn) {
     document.querySelectorAll('.fpo-filter').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    document.querySelectorAll('#fpoTable tbody tr').forEach(r => {
+    document.querySelectorAll('.fpo-table tbody tr').forEach(r => {
         r.style.display = (status === 'All' || r.dataset.status === status) ? '' : 'none';
+    });
+    document.querySelectorAll('.fpo-table').forEach(tbl => {
+        var card = tbl.closest('.card');
+        var visible = Array.from(tbl.querySelectorAll('tbody tr')).some(r => r.style.display !== 'none');
+        if (card) card.style.display = visible ? '' : 'none';
     });
 }
 </script>
@@ -221,13 +297,20 @@ function fpoFilter(status, btn) {
 <?php
 /* ── VIEW ── */
 elseif ($action === 'view' && $id > 0):
-$po = $db->query("SELECT p.*, v.vendor_name, v.address AS v_address, v.city AS v_city,
-    v.gstin AS v_gstin, v.phone AS v_phone
-    FROM fleet_purchase_orders p LEFT JOIN fleet_customers_master v ON p.vendor_id=v.id
+$po = $db->query("SELECT p.*, v.vendor_name, v.city AS v_city, v.gstin AS v_gstin, v.phone AS v_phone, co.company_name
+    FROM fleet_purchase_orders p
+    LEFT JOIN fleet_customers_master v ON p.vendor_id=v.id
+    LEFT JOIN companies co ON p.company_id=co.id
     WHERE p.id=$id LIMIT 1")->fetch_assoc();
 if (!$po) { echo '<div class="alert alert-danger">PO not found.</div>'; include '../includes/footer.php'; exit; }
 $items = $db->query("SELECT * FROM fleet_po_items WHERE po_id=$id ORDER BY id")->fetch_all(MYSQLI_ASSOC);
 $sc = $status_colors[$po['status']] ?? 'secondary';
+$is_igst = ($po['gst_type'] ?? 'IGST') === 'IGST';
+if (isset($_GET['approve']) && canDo('fleet_purchase_orders','update')) {
+    $db->query("UPDATE fleet_purchase_orders SET status='Approved' WHERE id=$id AND status='Draft'");
+    showAlert('success','PO Approved.');
+    redirect('fleet_purchase_orders.php?action=view&id='.$id);
+}
 ?>
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 fw-bold">PO: <?= htmlspecialchars($po['po_number']) ?>
@@ -243,24 +326,21 @@ $sc = $status_colors[$po['status']] ?? 'secondary';
         <a href="fleet_purchase_orders.php" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Back</a>
     </div>
 </div>
-<?php
-// Handle approve
-if (isset($_GET['approve']) && canDo('fleet_purchase_orders','update')) {
-    $db->query("UPDATE fleet_purchase_orders SET status='Approved' WHERE id=$id AND status='Draft'");
-    showAlert('success','PO Approved.');
-    redirect('fleet_purchase_orders.php?action=view&id='.$id);
-}
-?>
 <div class="row g-3">
 <div class="col-12 col-md-6"><div class="card h-100"><div class="card-header"><i class="bi bi-info-circle me-2"></i>PO Details</div>
 <div class="card-body"><table class="table table-sm mb-0">
-    <tr><td class="text-muted" style="width:45%">Company</td><td><?php if (count($all_companies)>1): ?><span class="badge bg-primary"><?= htmlspecialchars($po['company_name']??'—') ?></span><?php endif; ?></td></tr>
+    <?php if (count($all_companies)>1): ?>
+    <tr><td class="text-muted" style="width:45%">Company</td><td><span class="badge bg-primary"><?= htmlspecialchars($po['company_name']??'—') ?></span></td></tr>
+    <?php endif; ?>
     <tr><td class="text-muted">PO Number</td><td><strong><?= htmlspecialchars($po['po_number']) ?></strong></td></tr>
     <tr><td class="text-muted">PO Date</td><td><?= date('d/m/Y',strtotime($po['po_date'])) ?></td></tr>
     <tr><td class="text-muted">Validity</td><td><?= $po['validity_date'] ? date('d/m/Y',strtotime($po['validity_date'])) : '—' ?></td></tr>
     <tr><td class="text-muted">Payment Terms</td><td><?= htmlspecialchars($po['payment_terms'] ?: '—') ?></td></tr>
+    <tr><td class="text-muted">GST Type</td><td><span class="badge bg-info text-dark"><?= htmlspecialchars($po['gst_type'] ?? 'IGST') ?></span></td></tr>
     <tr><td class="text-muted">Delivery Address</td><td><?= htmlspecialchars($po['delivery_address'] ?: '—') ?></td></tr>
-    <tr><td class="text-muted">Total Amount</td><td><strong>₹<?= number_format($po['total_amount'],2) ?></strong></td></tr>
+    <tr><td class="text-muted">Subtotal</td><td>₹<?= number_format($po['subtotal'],2) ?></td></tr>
+    <tr><td class="text-muted">GST Amount</td><td>₹<?= number_format($po['gst_amount'],2) ?></td></tr>
+    <tr><td class="text-muted">Total Amount</td><td><strong class="text-success fs-6">₹<?= number_format($po['total_amount'],2) ?></strong></td></tr>
 </table></div></div></div>
 <div class="col-12 col-md-6"><div class="card h-100"><div class="card-header"><i class="bi bi-person-lines-fill me-2"></i>Customer / Buyer</div>
 <div class="card-body"><table class="table table-sm mb-0">
@@ -272,24 +352,43 @@ if (isset($_GET['approve']) && canDo('fleet_purchase_orders','update')) {
 <div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-list-ul me-2"></i>Items</div>
 <div class="card-body p-0"><div class="table-responsive">
 <table class="table table-sm mb-0">
-<thead><tr><th>#</th><th>Item</th><th>Description</th><th>UOM</th><th class="text-end">Qty</th><th class="text-end">Rate</th><th class="text-end">Amount</th></tr></thead>
+<thead class="table-light"><tr>
+    <th>#</th><th>Item</th><th>UOM</th><th class="text-end">Qty</th><th class="text-end">Rate</th>
+    <?php if ($is_igst): ?>
+    <th class="text-end">IGST%</th><th class="text-end">IGST Amt</th>
+    <?php else: ?>
+    <th class="text-end">CGST%</th><th class="text-end">CGST Amt</th>
+    <th class="text-end">SGST%</th><th class="text-end">SGST Amt</th>
+    <?php endif; ?>
+    <th class="text-end">Amount</th>
+</tr></thead>
 <tbody>
-<?php $ri=1; foreach ($items as $it): ?>
+<?php $ri=1; foreach ($items as $it):
+    $half_gst = ($it['gst_rate'] ?? 0) / 2;
+    $half_amt = ($it['gst_amount'] ?? 0) / 2;
+?>
 <tr>
     <td><?= $ri++ ?></td>
     <td><?= htmlspecialchars($it['item_name']) ?></td>
-    <td><?= htmlspecialchars($it['description'] ?: '—') ?></td>
     <td><?= htmlspecialchars($it['uom']) ?></td>
     <td class="text-end"><?= number_format($it['qty'],3) ?></td>
     <td class="text-end">₹<?= number_format($it['unit_price'],2) ?></td>
+    <?php if ($is_igst): ?>
+    <td class="text-end"><?= $it['gst_rate'] ?>%</td>
+    <td class="text-end">₹<?= number_format($it['gst_amount'],2) ?></td>
+    <?php else: ?>
+    <td class="text-end"><?= $half_gst ?>%</td><td class="text-end">₹<?= number_format($half_amt,2) ?></td>
+    <td class="text-end"><?= $half_gst ?>%</td><td class="text-end">₹<?= number_format($half_amt,2) ?></td>
+    <?php endif; ?>
     <td class="text-end"><strong>₹<?= number_format($it['amount'],2) ?></strong></td>
 </tr>
 <?php endforeach; ?>
 </tbody>
-<tfoot class="table-light"><tr>
-    <td colspan="6" class="text-end fw-bold">Total</td>
-    <td class="text-end fw-bold">₹<?= number_format($po['total_amount'],2) ?></td>
-</tr></tfoot>
+<tfoot class="table-light">
+    <tr><td colspan="<?= $is_igst ? 6 : 8 ?>" class="text-end fw-bold">Subtotal</td><td class="text-end fw-bold">₹<?= number_format($po['subtotal'],2) ?></td></tr>
+    <tr><td colspan="<?= $is_igst ? 6 : 8 ?>" class="text-end fw-bold">GST</td><td class="text-end fw-bold">₹<?= number_format($po['gst_amount'],2) ?></td></tr>
+    <tr class="table-success"><td colspan="<?= $is_igst ? 6 : 8 ?>" class="text-end fw-bold">Grand Total</td><td class="text-end fw-bold">₹<?= number_format($po['total_amount'],2) ?></td></tr>
+</tfoot>
 </table>
 </div></div></div></div>
 <?php if ($po['remarks']): ?>
@@ -306,6 +405,18 @@ if ($id > 0) {
     $po = $db->query("SELECT * FROM fleet_purchase_orders WHERE id=$id LIMIT 1")->fetch_assoc() ?? [];
     $po_items = $db->query("SELECT * FROM fleet_po_items WHERE po_id=$id ORDER BY id")->fetch_all(MYSQLI_ASSOC);
 }
+// Build customer JS map
+$customer_map = [];
+foreach ($vendors_raw as $v) {
+    $addr = trim(implode(', ', array_filter([
+        $v['ship_name'] ?? '',
+        $v['ship_address'] ?? '',
+        $v['ship_city'] ?? '',
+        $v['ship_state'] ?? '',
+        $v['ship_pincode'] ?? '',
+    ])));
+    $customer_map[$v['id']] = ['address' => $addr];
+}
 ?>
 <div class="d-flex justify-content-between align-items-center mb-3">
     <h5 class="mb-0 fw-bold"><?= $id > 0 ? 'Edit' : 'New' ?> Customer PO</h5>
@@ -313,24 +424,24 @@ if ($id > 0) {
 </div>
 <form method="POST">
 <input type="hidden" name="save_po" value="1">
-<?php if ($id > 0): ?><input type="hidden" name="po_number" value="<?= htmlspecialchars($po['po_number']) ?>"><?php endif; ?>
 <div class="row g-3">
 
+<!-- PO Details -->
 <div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-file-earmark-text me-2"></i>PO Details</div>
 <div class="card-body"><div class="row g-3">
-    <?php if ($id > 0): ?>
-    <div class="col-6 col-md-2">
-        <label class="form-label">PO Number</label>
-        <input type="text" class="form-control bg-light" value="<?= htmlspecialchars($po['po_number']) ?>" readonly>
-    </div>
-    <?php endif; ?>
     <div class="col-6 col-md-2">
         <label class="form-label fw-bold">PO Date *</label>
         <input type="date" name="po_date" class="form-control" value="<?= $po['po_date'] ?? date('Y-m-d') ?>" required>
     </div>
+    <div class="col-6 col-md-2">
+        <label class="form-label fw-bold">PO Number *</label>
+        <input type="text" name="po_number" class="form-control" required
+               value="<?= htmlspecialchars($po['po_number'] ?? '') ?>"
+               placeholder="Enter customer PO no.">
+    </div>
     <div class="col-12 col-md-4">
         <label class="form-label fw-bold">Customer / Buyer *</label>
-        <select name="vendor_id" class="form-select" required>
+        <select name="vendor_id" id="vendorSelect" class="form-select" required onchange="fillCustomerData(this)">
             <option value="">— Select Customer —</option>
             <?php foreach ($vendors as $v): ?>
             <option value="<?= $v['id'] ?>" <?= ($po['vendor_id'] ?? 0) == $v['id'] ? 'selected' : '' ?>>
@@ -351,13 +462,21 @@ if ($id > 0) {
             <?php endforeach; ?>
         </select>
     </div>
+    <div class="col-6 col-md-2">
+        <label class="form-label fw-bold">GST Type</label>
+        <select name="gst_type" id="gstTypeSelect" class="form-select" onchange="updateGstHeaders()">
+            <option value="IGST"      <?= ($po['gst_type'] ?? 'IGST') === 'IGST'       ? 'selected' : '' ?>>IGST</option>
+            <option value="CGST+SGST" <?= ($po['gst_type'] ?? '') === 'CGST+SGST' ? 'selected' : '' ?>>CGST + SGST</option>
+        </select>
+    </div>
     <div class="col-6 col-md-3">
         <label class="form-label">Payment Terms</label>
         <input type="text" name="payment_terms" class="form-control" value="<?= htmlspecialchars($po['payment_terms'] ?? '') ?>" placeholder="e.g. 30 days">
     </div>
     <div class="col-12 col-md-5">
-        <label class="form-label">Delivery Address</label>
-        <input type="text" name="delivery_address" class="form-control" value="<?= htmlspecialchars($po['delivery_address'] ?? '') ?>">
+        <label class="form-label">Delivery Address <small class="text-muted">(auto-filled from Ship-To)</small></label>
+        <input type="text" name="delivery_address" id="deliveryAddress" class="form-control bg-light"
+               value="<?= htmlspecialchars($po['delivery_address'] ?? '') ?>" readonly>
     </div>
 </div></div></div></div>
 
@@ -368,45 +487,72 @@ if ($id > 0) {
 </div>
 <div class="card-body p-0"><div class="table-responsive">
 <table class="table table-sm mb-0" id="fpoItemsTable">
-<thead class="table-light"><tr>
-    <th>Item Name</th><th>Description</th><th>UOM</th>
-    <th style="width:100px">Qty</th><th style="width:110px">Rate (₹)</th>
-    <th style="width:110px">Amount (₹)</th><th style="width:36px"></th>
+<thead class="table-light" id="fpoItemsHead"><tr>
+    <th>Item</th><th>UOM</th>
+    <th style="width:90px">Qty</th>
+    <th style="width:100px">Rate (₹)</th>
+    <th style="width:80px" id="gstHeader">GST%</th>
+    <th style="width:100px" id="gstAmtHeader">GST Amt</th>
+    <th style="width:110px">Amount (₹)</th>
+    <th style="width:36px"></th>
 </tr></thead>
 <tbody id="fpoItemsBody">
 <?php if ($po_items): foreach ($po_items as $it): ?>
 <tr class="fpo-item-row">
-    <td><input type="text" name="item_name[]" class="form-control form-control-sm" value="<?= htmlspecialchars($it['item_name']) ?>" required></td>
-    <td><input type="text" name="item_desc[]" class="form-control form-control-sm" value="<?= htmlspecialchars($it['description'] ?? '') ?>"></td>
-    <td><select name="item_uom[]" class="form-select form-select-sm">
-        <?php foreach (['MT','Kg','Litre','Nos','Bags','Set'] as $u): ?>
-        <option <?= ($it['uom'] ?? 'MT') === $u ? 'selected' : '' ?>><?= $u ?></option>
+    <td><select name="item_name[]" class="form-select form-select-sm fpo-item-select" onchange="fpoItemSelected(this)" required>
+        <option value="">-- Select Item --</option>
+        <?php foreach ($items_master as $im): ?>
+        <option value="<?= htmlspecialchars($im['item_name']) ?>" data-uom="<?= htmlspecialchars($im['uom']) ?>"
+            <?= $it['item_name'] === $im['item_name'] ? 'selected' : '' ?>>
+            <?= htmlspecialchars($im['item_name']) ?>
+        </option>
         <?php endforeach; ?>
     </select></td>
-    <td><input type="number" name="item_qty[]" class="form-control form-control-sm fpo-qty" step="0.001" value="<?= $it['qty'] ?>" onchange="calcFpoRow(this)"></td>
+    <td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light fpo-uom" value="<?= htmlspecialchars($it['uom']) ?>" readonly></td>
+    <td><input type="number" name="item_qty[]" class="form-control form-control-sm fpo-qty" step="0.001" value="<?= $it['qty'] ?>" onchange="calcFpoRow(this)" required></td>
     <td><input type="number" name="item_price[]" class="form-control form-control-sm fpo-price" step="0.01" value="<?= $it['unit_price'] ?>" onchange="calcFpoRow(this)"></td>
-    <td><input type="text" name="item_amount[]" class="form-control form-control-sm fpo-amt bg-light" readonly value="<?= $it['amount'] ?>"></td>
+    <td><input type="number" name="item_gst[]" class="form-control form-control-sm fpo-gst" step="0.01" value="<?= $it['gst_rate'] ?? 0 ?>" onchange="calcFpoRow(this)"></td>
+    <td><input type="text" class="form-control form-control-sm fpo-gst-amt bg-light" readonly value="<?= number_format($it['gst_amount'] ?? 0, 2) ?>"></td>
+    <td><input type="text" name="item_amount[]" class="form-control form-control-sm fpo-amt bg-light fw-semibold" readonly value="<?= $it['amount'] ?>"></td>
     <td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeFpoRow(this)"><i class="bi bi-x"></i></button></td>
 </tr>
 <?php endforeach; else: ?>
 <tr class="fpo-item-row">
-    <td><input type="text" name="item_name[]" class="form-control form-control-sm" required></td>
-    <td><input type="text" name="item_desc[]" class="form-control form-control-sm"></td>
-    <td><select name="item_uom[]" class="form-select form-select-sm">
-        <?php foreach (['MT','Kg','Litre','Nos','Bags','Set'] as $u): ?><option><?= $u ?></option><?php endforeach; ?>
+    <td><select name="item_name[]" class="form-select form-select-sm fpo-item-select" onchange="fpoItemSelected(this)" required>
+        <option value="">-- Select Item --</option>
+        <?php foreach ($items_master as $im): ?>
+        <option value="<?= htmlspecialchars($im['item_name']) ?>" data-uom="<?= htmlspecialchars($im['uom']) ?>">
+            <?= htmlspecialchars($im['item_name']) ?>
+        </option>
+        <?php endforeach; ?>
     </select></td>
-    <td><input type="number" name="item_qty[]" class="form-control form-control-sm fpo-qty" step="0.001" onchange="calcFpoRow(this)"></td>
+    <td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light fpo-uom" readonly></td>
+    <td><input type="number" name="item_qty[]" class="form-control form-control-sm fpo-qty" step="0.001" onchange="calcFpoRow(this)" required></td>
     <td><input type="number" name="item_price[]" class="form-control form-control-sm fpo-price" step="0.01" onchange="calcFpoRow(this)"></td>
-    <td><input type="text" name="item_amount[]" class="form-control form-control-sm fpo-amt bg-light" readonly></td>
+    <td><input type="number" name="item_gst[]" class="form-control form-control-sm fpo-gst" step="0.01" value="0" onchange="calcFpoRow(this)"></td>
+    <td><input type="text" class="form-control form-control-sm fpo-gst-amt bg-light" readonly value="0.00"></td>
+    <td><input type="text" name="item_amount[]" class="form-control form-control-sm fpo-amt bg-light fw-semibold" readonly></td>
     <td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeFpoRow(this)"><i class="bi bi-x"></i></button></td>
 </tr>
 <?php endif; ?>
 </tbody>
-<tfoot class="table-light"><tr>
-    <td colspan="5" class="text-end fw-bold">Total</td>
-    <td><strong id="fpoFootTotal">₹0.00</strong></td>
-    <td></td>
-</tr></tfoot>
+<tfoot class="table-light">
+    <tr>
+        <td colspan="5" class="text-end fw-bold">Subtotal</td>
+        <td colspan="2"><strong id="fpoSubTotal">₹0.00</strong></td>
+        <td></td>
+    </tr>
+    <tr>
+        <td colspan="5" class="text-end fw-bold">GST Total</td>
+        <td colspan="2"><strong id="fpoGstTotal">₹0.00</strong></td>
+        <td></td>
+    </tr>
+    <tr class="table-success">
+        <td colspan="5" class="text-end fw-bold">Grand Total</td>
+        <td colspan="2"><strong id="fpoFootTotal">₹0.00</strong></td>
+        <td></td>
+    </tr>
+</tfoot>
 </table>
 </div></div></div></div>
 
@@ -421,39 +567,117 @@ if ($id > 0) {
 </div>
 </div>
 </form>
+
 <script>
-function addFpoRow() {
-    var tbody = document.getElementById('fpoItemsBody');
+// ── Customer & Items data from server ──
+const customerMap  = <?= json_encode($customer_map, JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
+const itemsMaster  = <?= json_encode($items_master, JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
+
+// ── Fill delivery address + items when customer selected ──
+function fillCustomerData(sel) {
+    var vid  = parseInt(sel.value) || 0;
+    var data = customerMap[vid] || {};
+
+    // 1. Delivery Address (readonly, from ship address)
+    document.getElementById('deliveryAddress').value = data.address || '';
+
+    // 2. Reset to single blank item row
+    if (vid) {
+        var tbody = document.getElementById('fpoItemsBody');
+        tbody.innerHTML = '';
+        tbody.appendChild(makeFpoRow('', ''));
+        calcFpoTotal();
+    }
+}
+
+// ── Make a new item row ──
+function makeFpoRow(itemName, uom) {
     var tr = document.createElement('tr');
     tr.className = 'fpo-item-row';
-    var uomOpts = ['MT','Kg','Litre','Nos','Bags','Set'].map(u => '<option>'+u+'</option>').join('');
+    var opts = '<option value="">-- Select Item --</option>';
+    itemsMaster.forEach(function(it) {
+        var sel = (it.item_name === itemName) ? ' selected' : '';
+        opts += '<option value="' + it.item_name + '" data-uom="' + it.uom + '"' + sel + '>' + it.item_name + '</option>';
+    });
     tr.innerHTML =
-        '<td><input type="text" name="item_name[]" class="form-control form-control-sm" required></td>'+
-        '<td><input type="text" name="item_desc[]" class="form-control form-control-sm"></td>'+
-        '<td><select name="item_uom[]" class="form-select form-select-sm">'+uomOpts+'</select></td>'+
-        '<td><input type="number" name="item_qty[]" class="form-control form-control-sm fpo-qty" step="0.001" onchange="calcFpoRow(this)"></td>'+
-        '<td><input type="number" name="item_price[]" class="form-control form-control-sm fpo-price" step="0.01" onchange="calcFpoRow(this)"></td>'+
-        '<td><input type="text" name="item_amount[]" class="form-control form-control-sm fpo-amt bg-light" readonly></td>'+
+        '<td><select name="item_name[]" class="form-select form-select-sm fpo-item-select" onchange="fpoItemSelected(this)" required>' + opts + '</select></td>' +
+        '<td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light fpo-uom" value="' + (uom||'') + '" readonly></td>' +
+        '<td><input type="number" name="item_qty[]" class="form-control form-control-sm fpo-qty" step="0.001" onchange="calcFpoRow(this)" required></td>' +
+        '<td><input type="number" name="item_price[]" class="form-control form-control-sm fpo-price" step="0.01" onchange="calcFpoRow(this)"></td>' +
+        '<td><input type="number" name="item_gst[]" class="form-control form-control-sm fpo-gst" step="0.01" value="0" onchange="calcFpoRow(this)"></td>' +
+        '<td><input type="text" class="form-control form-control-sm fpo-gst-amt bg-light" readonly value="0.00"></td>' +
+        '<td><input type="text" name="item_amount[]" class="form-control form-control-sm fpo-amt bg-light fw-semibold" readonly></td>' +
         '<td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeFpoRow(this)"><i class="bi bi-x"></i></button></td>';
-    tbody.appendChild(tr);
+    return tr;
 }
+
+function fpoItemSelected(sel) {
+    var opt = sel.options[sel.selectedIndex];
+    var uom = opt ? (opt.getAttribute('data-uom') || '') : '';
+    var tr  = sel.closest('tr');
+    var uomEl = tr.querySelector('.fpo-uom');
+    if (uomEl) uomEl.value = uom;
+}
+
+function addFpoRow() {
+    document.getElementById('fpoItemsBody').appendChild(makeFpoRow('', ''));
+}
+
 function removeFpoRow(btn) {
     var rows = document.querySelectorAll('.fpo-item-row');
     if (rows.length > 1) { btn.closest('tr').remove(); calcFpoTotal(); }
 }
+
 function calcFpoRow(el) {
-    var tr  = el.closest('tr');
-    var qty = parseFloat(tr.querySelector('.fpo-qty').value)   || 0;
-    var prc = parseFloat(tr.querySelector('.fpo-price').value) || 0;
-    tr.querySelector('.fpo-amt').value = (qty * prc).toFixed(2);
+    var tr    = el.closest('tr');
+    var qty   = parseFloat(tr.querySelector('.fpo-qty').value)   || 0;
+    var prc   = parseFloat(tr.querySelector('.fpo-price').value) || 0;
+    var gst   = parseFloat(tr.querySelector('.fpo-gst').value)   || 0;
+    var base  = qty * prc;
+    var gstAmt= base * gst / 100;
+    tr.querySelector('.fpo-gst-amt').value = gstAmt.toFixed(2);
+    tr.querySelector('.fpo-amt').value     = (base + gstAmt).toFixed(2);
     calcFpoTotal();
 }
+
 function calcFpoTotal() {
-    var total = 0;
-    document.querySelectorAll('.fpo-amt').forEach(function(el) { total += parseFloat(el.value) || 0; });
-    document.getElementById('fpoFootTotal').textContent = '₹' + total.toFixed(2);
+    var subtotal = 0, gstTotal = 0;
+    document.querySelectorAll('.fpo-item-row').forEach(function(tr) {
+        var qty  = parseFloat(tr.querySelector('.fpo-qty')?.value)   || 0;
+        var prc  = parseFloat(tr.querySelector('.fpo-price')?.value) || 0;
+        var gst  = parseFloat(tr.querySelector('.fpo-gst')?.value)   || 0;
+        var base = qty * prc;
+        subtotal  += base;
+        gstTotal  += base * gst / 100;
+    });
+    document.getElementById('fpoSubTotal').textContent  = '₹' + subtotal.toFixed(2);
+    document.getElementById('fpoGstTotal').textContent  = '₹' + gstTotal.toFixed(2);
+    document.getElementById('fpoFootTotal').textContent = '₹' + (subtotal + gstTotal).toFixed(2);
 }
+
+function updateGstHeaders() {
+    var isIgst = document.getElementById('gstTypeSelect').value === 'IGST';
+    document.getElementById('gstHeader').textContent    = isIgst ? 'IGST%' : 'GST%';
+    document.getElementById('gstAmtHeader').textContent = isIgst ? 'IGST Amt' : 'GST Amt';
+}
+
+// Init on load
 calcFpoTotal();
+updateGstHeaders();
+
+// If editing existing PO, trigger address fill silently
+<?php if ($id > 0 && !empty($po['vendor_id'])): ?>
+(function() {
+    var sel = document.getElementById('vendorSelect');
+    if (sel) {
+        var vid = <?= (int)$po['vendor_id'] ?>;
+        var data = customerMap[vid] || {};
+        // Only fill address if delivery_address is empty (don't override saved value)
+        var addrEl = document.getElementById('deliveryAddress');
+        if (addrEl && !addrEl.value && data.address) addrEl.value = data.address;
+    }
+})();
+<?php endif; ?>
 </script>
 <?php endif; ?>
 <?php include '../includes/footer.php'; ?>

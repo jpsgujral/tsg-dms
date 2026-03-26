@@ -7,7 +7,7 @@ requirePerm('fleet_customers_master', 'view');
 /* ── Create table — same structure as despatch vendors ── */
 $db->query("CREATE TABLE IF NOT EXISTS fleet_customers_master (
     id              INT AUTO_INCREMENT PRIMARY KEY,
-    vendor_code     VARCHAR(20) UNIQUE NOT NULL,
+    vendor_code     VARCHAR(20) NOT NULL,
     vendor_name     VARCHAR(100) NOT NULL,
     contact_person  VARCHAR(100),
     email           VARCHAR(100),
@@ -45,6 +45,18 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_customers_master (
     notes           TEXT,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+/* ── Drop unique index on vendor_code if it exists (allow duplicate codes) ── */
+(function($db){
+    $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+    $idx = $db->query("SELECT INDEX_NAME FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_customers_master'
+        AND COLUMN_NAME='vendor_code' AND NON_UNIQUE=0 LIMIT 1")->fetch_assoc();
+    if ($idx) {
+        $idxName = $db->real_escape_string($idx['INDEX_NAME']);
+        $db->query("ALTER TABLE fleet_customers_master DROP INDEX `$idxName`");
+    }
+})($db);
 
 /* ── Add company_id if upgrading ── */
 (function($db){
@@ -114,7 +126,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_customer'])) {
     $accno   = sanitize($_POST['account_no']     ?? '');
     $ifsc    = sanitize($_POST['ifsc_code']      ?? '');
     $notes   = sanitize($_POST['notes']          ?? '');
-    $co_id   = (int)($_POST['company_id']          ?? activeCompanyId());
+    $co_id   = (int)($_POST['company_id']        ?? activeCompanyId());
 
     if (!$code || !$name) {
         showAlert('danger', 'Customer Code and Name are required.');
@@ -162,7 +174,14 @@ include '../includes/header.php';
    LIST
 ══════════════════════════════════ */
 if ($action === 'list'):
-$customers = $db->query("SELECT fcm.*, co.company_name FROM fleet_customers_master fcm LEFT JOIN companies co ON fcm.company_id=co.id ORDER BY fcm.status ASC, fcm.vendor_name ASC")->fetch_all(MYSQLI_ASSOC);
+$customers = $db->query("SELECT fcm.*, co.company_name FROM fleet_customers_master fcm LEFT JOIN companies co ON fcm.company_id=co.id ORDER BY co.company_name ASC, fcm.status ASC, fcm.vendor_name ASC")->fetch_all(MYSQLI_ASSOC);
+
+// Group by company
+$grouped = [];
+foreach ($customers as $c) {
+    $key = $c['company_name'] ?? 'Unassigned';
+    $grouped[$key][] = $c;
+}
 ?>
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 fw-bold">Fleet Customer Master</h5>
@@ -170,23 +189,28 @@ $customers = $db->query("SELECT fcm.*, co.company_name FROM fleet_customers_mast
     <a href="?action=add" class="btn btn-primary"><i class="bi bi-plus-circle me-1"></i>Add Customer</a>
     <?php endif; ?>
 </div>
-<div class="card">
+
+<?php foreach ($grouped as $companyName => $list): ?>
+<div class="card mb-3">
+<div class="card-header d-flex justify-content-between align-items-center py-2">
+    <span><i class="bi bi-buildings me-2"></i><strong><?= htmlspecialchars($companyName) ?></strong></span>
+    <span class="badge bg-secondary"><?= count($list) ?> customer<?= count($list) > 1 ? 's' : '' ?></span>
+</div>
 <div class="card-body p-0">
 <div class="table-responsive">
 <table class="table table-hover datatable mb-0">
 <thead><tr>
-    <th>Code</th><th>Customer Name</th><th>Company</th><th>Contact</th><th>Phone</th>
+    <th>Code</th><th>Customer Name</th><th>Contact</th><th>Phone</th>
     <th>City</th><th>GSTIN</th><th>Status</th><th>Actions</th>
 </tr></thead>
 <tbody>
-<?php foreach ($customers as $c):
+<?php foreach ($list as $c):
     $sc = $c['status'] === 'Active' ? 'success' : 'secondary';
 ?>
 <tr>
     <td><?= htmlspecialchars($c['vendor_code']) ?></td>
     <td><strong><?= htmlspecialchars($c['vendor_name']) ?></strong><br>
         <small class="text-muted"><?= htmlspecialchars($c['contact_person'] ?: '') ?></small></td>
-    <td><?php if (count($all_companies)>1): ?><span class='badge bg-primary' style='font-size:.7rem'><?= htmlspecialchars($c['company_name']??'-') ?></span><?php else: ?>—<?php endif; ?></td>
     <td><?= htmlspecialchars($c['contact_person'] ?: '—') ?></td>
     <td><?= htmlspecialchars($c['phone'] ?: ($c['mobile'] ?: '—')) ?></td>
     <td><?= htmlspecialchars($c['city'] ?: '—') ?></td>
@@ -205,6 +229,7 @@ $customers = $db->query("SELECT fcm.*, co.company_name FROM fleet_customers_mast
 </tbody>
 </table>
 </div></div></div>
+<?php endforeach; ?>
 
 <?php
 /* ══════════════════════════════════
