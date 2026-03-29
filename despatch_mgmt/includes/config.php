@@ -1,5 +1,163 @@
 <?php
 if (session_status() === PHP_SESSION_NONE) session_start();
+ob_start(); // Buffer all output — prevents "headers already sent" and allows clean error pages
+
+// ══════════════════════════════════════════════════════════
+// ERROR HANDLING CONFIGURATION
+// ══════════════════════════════════════════════════════════
+define('APP_DEBUG', false); // Set true only on local dev — never on production
+define('APP_LOG_ERRORS', true);
+define('APP_ERROR_LOG_FILE', __DIR__ . '/../logs/app_errors.log');
+
+// Suppress raw PHP errors from displaying to users
+error_reporting(E_ALL);
+ini_set('display_errors', APP_DEBUG ? '1' : '0');
+ini_set('log_errors', '1');
+ini_set('error_log', APP_ERROR_LOG_FILE);
+
+// Ensure logs directory exists
+if (!is_dir(__DIR__ . '/../logs')) {
+    @mkdir(__DIR__ . '/../logs', 0755, true);
+}
+
+// ── Global error handler ──
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    // Ignore suppressed errors (@function calls)
+    if (error_reporting() === 0) return false;
+
+    $levels = [
+        E_ERROR => 'ERROR', E_WARNING => 'WARNING', E_NOTICE => 'NOTICE',
+        E_DEPRECATED => 'DEPRECATED', E_USER_ERROR => 'USER_ERROR',
+        E_USER_WARNING => 'USER_WARNING', E_USER_NOTICE => 'USER_NOTICE',
+    ];
+    $level = $levels[$errno] ?? 'UNKNOWN';
+
+    // Skip non-critical notices/deprecations in production
+    if (!APP_DEBUG && in_array($errno, [E_NOTICE, E_DEPRECATED, E_USER_NOTICE])) return false;
+
+    dmsLogError($level, $errstr, $errfile, $errline);
+
+    // For fatal-level errors show friendly page
+    if (in_array($errno, [E_ERROR, E_USER_ERROR])) {
+        dmsShowErrorPage($errstr);
+    }
+
+    return true;
+});
+
+// ── Global exception handler ──
+set_exception_handler(function(Throwable $e) {
+    dmsLogError('EXCEPTION', $e->getMessage(), $e->getFile(), $e->getLine(), $e->getTraceAsString());
+    dmsShowErrorPage($e->getMessage());
+});
+
+// ── Log error to file + DB ──
+function dmsLogError(string $level, string $message, string $file = '', int $line = 0, string $trace = '') {
+    // Sanitise file path — strip server root for brevity
+    $file = str_replace($_SERVER['DOCUMENT_ROOT'] ?? '', '', $file);
+
+    // Write to log file
+    if (APP_LOG_ERRORS) {
+        $entry = sprintf("[%s] [%s] %s in %s on line %d\n", date('Y-m-d H:i:s'), $level, $message, $file, $line);
+        @error_log($entry, 3, APP_ERROR_LOG_FILE);
+    }
+
+    // Write to DB (non-fatal only — avoid loop if DB itself has an error)
+    if ($level !== 'DB_CONNECTION') {
+        try {
+            $db = getDB();
+            // Always ensure table exists before inserting
+            $db->query("CREATE TABLE IF NOT EXISTS app_error_log (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                logged_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                level       VARCHAR(20),
+                message     VARCHAR(1000),
+                file        VARCHAR(255),
+                line        INT DEFAULT 0,
+                url         VARCHAR(500),
+                user_id     INT DEFAULT 0,
+                trace       TEXT,
+                resolved    TINYINT DEFAULT 0
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            $url    = $db->real_escape_string(substr($_SERVER['REQUEST_URI'] ?? '', 0, 500));
+            $user   = (int)($_SESSION['user_id'] ?? 0);
+            $msg    = $db->real_escape_string(substr($message, 0, 1000));
+            $fil    = $db->real_escape_string(substr($file, 0, 255));
+            $trc    = $db->real_escape_string(substr($trace, 0, 2000));
+            $lv     = $db->real_escape_string($level);
+            $db->query("INSERT INTO app_error_log (level,message,file,line,url,user_id,trace)
+                VALUES ('$lv','$msg','$fil',$line,'$url',$user,'$trc')");
+        } catch (Throwable $ex) {
+            // DB logging failed — already written to file, silently ignore
+        }
+    }
+}
+
+// ── Friendly error page ──
+function dmsShowErrorPage(string $detail = '') {
+    // Don't show page for AJAX / JSON requests
+    $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) ||
+              (isset($_SERVER['HTTP_ACCEPT']) && strpos($_SERVER['HTTP_ACCEPT'], 'application/json') !== false) ||
+              isset($_GET['ajax']);
+    if ($isAjax) {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'error' => APP_DEBUG ? $detail : 'A server error occurred.']);
+        exit;
+    }
+
+    // For print/challan pages — simple text
+    $uri = $_SERVER['REQUEST_URI'] ?? '';
+    if (strpos($uri, 'challan') !== false || strpos($uri, 'print') !== false) {
+        ob_clean();
+        echo '<div style="font-family:Arial;padding:40px;color:#c00"><h2>Error</h2><p>' .
+             (APP_DEBUG ? htmlspecialchars($detail) : 'A server error occurred. Please go back and try again.') .
+             '</p></div>';
+        exit;
+    }
+
+    ob_clean();
+    $show = APP_DEBUG ? htmlspecialchars($detail) : '';
+    http_response_code(500);
+    echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Error — ' . APP_NAME . '</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+</head><body style="background:#f0f8f3">
+<div class="d-flex align-items-center justify-content-center" style="min-height:100vh">
+<div class="card shadow" style="max-width:520px;width:100%">
+<div class="card-header text-white text-center py-3" style="background:#1a5632">
+    <i class="bi bi-exclamation-triangle-fill fs-3"></i>
+    <h5 class="mt-2 mb-0">Something went wrong</h5>
+</div>
+<div class="card-body text-center py-4">
+    <p class="text-muted mb-3">An unexpected error occurred. Our team has been notified.</p>
+    ' . ($show ? '<div class="alert alert-danger text-start small"><strong>Details:</strong><br>' . $show . '</div>' : '') . '
+    <a href="javascript:history.back()" class="btn btn-outline-secondary me-2">
+        <i class="bi bi-arrow-left me-1"></i>Go Back
+    </a>
+    <a href="../modules/index.php" class="btn" style="background:#1a5632;color:#fff">
+        <i class="bi bi-house me-1"></i>Dashboard
+    </a>
+</div>
+<div class="card-footer text-center text-muted small py-2">' . APP_NAME . ' &bull; Error has been logged</div>
+</div></div></body></html>';
+    exit;
+}
+
+// ── Safe DB query wrapper — logs SQL errors automatically ──
+function dbQuery(string $sql) {
+    $db = getDB();
+    $result = $db->query($sql);
+    if ($result === false) {
+        dmsLogError('DB_QUERY', $db->error . ' | SQL: ' . substr($sql, 0, 500), '', 0);
+        if (APP_DEBUG) {
+            throw new RuntimeException('DB Error: ' . $db->error);
+        }
+    }
+    return $result;
+}
 
 // Database Configuration
 define('DB_HOST', 'localhost');
@@ -15,9 +173,11 @@ function getDB() {
     if ($conn === null) {
         $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
         if ($conn->connect_error) {
-            die("Connection failed: " . $conn->connect_error);
+            dmsLogError('DB_CONNECTION', $conn->connect_error, __FILE__, __LINE__);
+            dmsShowErrorPage('Database connection failed. Please try again later.');
         }
         $conn->set_charset("utf8mb4");
+        mysqli_report(MYSQLI_REPORT_OFF); // Errors handled manually via dmsLogError/exception handler
 
         $db_name = DB_NAME;
 

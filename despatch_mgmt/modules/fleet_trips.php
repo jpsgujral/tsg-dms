@@ -1,7 +1,56 @@
 <?php
+ob_start();
 require_once '../includes/config.php';
 require_once '../includes/auth.php';
 $db = getDB();
+
+/* ── AJAX: Add new source of material ── */
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'add_source' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    ob_clean(); // discard any output already sent (warnings etc.)
+    header('Content-Type: application/json');
+    try {
+        $source_name = trim($db->real_escape_string($_POST['source_name'] ?? ''));
+        if (!$source_name) {
+            echo json_encode(['success' => false, 'error' => 'Source name required.']);
+            exit;
+        }
+        // Check if already exists
+        $exists = $db->query("SELECT id FROM source_of_material WHERE source_name='$source_name' LIMIT 1")->fetch_assoc();
+        if ($exists) {
+            echo json_encode(['success' => true, 'source_name' => html_entity_decode($source_name, ENT_QUOTES, 'UTF-8')]);
+            exit;
+        }
+        // Generate a simple source code from name (first 3 chars uppercase + random)
+        $source_code = strtoupper(substr(preg_replace('/[^A-Za-z0-9]/', '', $source_name), 0, 3)) . rand(10,99);
+        // Check if status column exists
+        $dbname2   = $db->query("SELECT DATABASE()")->fetch_row()[0];
+        $has_status= $db->query("SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='$dbname2' AND TABLE_NAME='source_of_material'
+            AND COLUMN_NAME='status' LIMIT 1")->num_rows;
+        $has_code  = $db->query("SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='$dbname2' AND TABLE_NAME='source_of_material'
+            AND COLUMN_NAME='source_code' LIMIT 1")->num_rows;
+        $esc_code = $db->real_escape_string($source_code);
+        if ($has_status && $has_code) {
+            $db->query("INSERT INTO source_of_material (source_code, source_name, status) VALUES ('$esc_code', '$source_name', 'Active')");
+        } elseif ($has_code) {
+            $db->query("INSERT INTO source_of_material (source_code, source_name) VALUES ('$esc_code', '$source_name')");
+        } elseif ($has_status) {
+            $db->query("INSERT INTO source_of_material (source_name, status) VALUES ('$source_name', 'Active')");
+        } else {
+            $db->query("INSERT INTO source_of_material (source_name) VALUES ('$source_name')");
+        }
+        if ($db->insert_id > 0) {
+            echo json_encode(['success' => true, 'source_name' => html_entity_decode($source_name, ENT_QUOTES, 'UTF-8')]);
+        } else {
+            echo json_encode(['success' => false, 'error' => $db->error ?: 'Insert failed.']);
+        }
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+    }
+    exit;
+}
+
 requirePerm('fleet_trips', 'view');
 
 /* ── Safe ALTER helper ── */
@@ -293,14 +342,21 @@ if ($vd_res) while ($vdr = $vd_res->fetch_assoc()) {
 $po_vendor_map = [];
 $po_addr_map   = [];
 $po_rate_map   = [];
+$po_items_map  = [];
 foreach ($pos as $p) {
     $po_vendor_map[$p['id']] = $p['vendor_id'];
     $po_addr_map[$p['id']]   = $p['delivery_address'] ?? '';
 }
-// Get freight rate from fleet_po_items (unit_price of first item = rate per MT)
-$po_rates_res = $db->query("SELECT po_id, unit_price FROM fleet_po_items ORDER BY po_id, id");
-if ($po_rates_res) while ($pr = $po_rates_res->fetch_assoc()) {
-    if (!isset($po_rate_map[$pr['po_id']])) $po_rate_map[$pr['po_id']] = (float)$pr['unit_price'];
+// Get all items per PO for auto-populate
+$po_items_res = $db->query("SELECT po_id, item_name, uom, unit_price, qty FROM fleet_po_items ORDER BY po_id, id");
+if ($po_items_res) while ($pr = $po_items_res->fetch_assoc()) {
+    $pid = (int)$pr['po_id'];
+    if (!isset($po_rate_map[$pid])) $po_rate_map[$pid] = (float)$pr['unit_price'];
+    $po_items_map[$pid][] = [
+        'item_name'  => $pr['item_name'],
+        'uom'        => $pr['uom'],
+        'unit_price' => (float)$pr['unit_price'],
+    ];
 }
 
 /* Vendor → ship address map for JS */
@@ -523,6 +579,124 @@ $sc  = $status_colors[$t['status']] ?? 'secondary';
 <?php if ($t['remarks']): ?>
 <div class="col-12"><div class="card"><div class="card-body"><strong>Remarks:</strong> <?= htmlspecialchars($t['remarks']) ?></div></div></div>
 <?php endif; ?>
+
+<?php
+/* ── Fuel entries for this trip ── */
+$fuel_entries = $db->query("SELECT fl.*, fc.company_name AS fuel_company
+    FROM fleet_fuel_log fl
+    LEFT JOIN fleet_fuel_companies fc ON fl.fuel_company_id=fc.id
+    WHERE fl.trip_id=$id ORDER BY fl.fuel_date ASC, fl.id ASC")->fetch_all(MYSQLI_ASSOC);
+$total_fuel_litres = array_sum(array_column($fuel_entries, 'litres'));
+$total_fuel_cost   = array_sum(array_column($fuel_entries, 'amount'));
+
+/* ── P&L ── */
+$freight_income  = (float)($t['freight_amount'] ?? 0);
+$driver_advance  = (float)($t['driver_advance']  ?? 0);
+$total_expenses  = $total_fuel_cost + $driver_advance;
+$net_profit      = $freight_income - $total_expenses;
+?>
+
+<!-- Fuel Entries -->
+<div class="col-12"><div class="card">
+<div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-droplet-fill me-2 text-warning"></i>Fuel Entries
+        <?php if ($total_fuel_litres > 0): ?>
+        <span class="badge bg-warning text-dark ms-2"><?= number_format($total_fuel_litres,2) ?> L</span>
+        <span class="badge bg-danger ms-1">₹<?= number_format($total_fuel_cost,2) ?></span>
+        <?php endif; ?>
+    </span>
+    <?php if (canDo('fleet_fuel','create')): ?>
+    <a href="fleet_fuel.php?action=add&trip=<?= $id ?>&back=<?= $id ?>" class="btn btn-warning btn-sm">
+        <i class="bi bi-plus-circle me-1"></i>Add Fuel Entry
+    </a>
+    <?php endif; ?>
+</div>
+<?php if ($fuel_entries): ?>
+<div class="card-body p-0"><div class="table-responsive">
+<table class="table table-sm mb-0">
+<thead class="table-warning"><tr>
+    <th>Date</th><th>Fuel Company</th>
+    <th class="text-end">Litres</th><th class="text-end">Rate/L</th>
+    <th class="text-end">Amount</th><th>Mode</th><th>Notes</th>
+    <?php if (canDo('fleet_fuel','update') || isAdmin()): ?><th></th><?php endif; ?>
+</tr></thead>
+<tbody>
+<?php foreach ($fuel_entries as $fe): ?>
+<tr>
+    <td><?= date('d/m/Y',strtotime($fe['fuel_date'])) ?></td>
+    <td><?= htmlspecialchars($fe['fuel_company'] ?? '—') ?></td>
+    <td class="text-end"><?= number_format($fe['litres'],2) ?> L</td>
+    <td class="text-end">₹<?= number_format($fe['rate_per_litre'],2) ?></td>
+    <td class="text-end fw-bold">₹<?= number_format($fe['amount'],2) ?></td>
+    <td><span class="badge bg-<?= $fe['payment_mode']==='Credit'?'warning text-dark':'success' ?>"><?= $fe['payment_mode'] ?></span></td>
+    <td><small class="text-muted"><?= htmlspecialchars($fe['notes']??'') ?></small></td>
+    <?php if (canDo('fleet_fuel','update') || isAdmin()): ?>
+    <td>
+        <?php if (canDo('fleet_fuel','update')): ?>
+        <a href="fleet_fuel.php?action=edit&id=<?= $fe['id'] ?>&back=<?= $id ?>" class="btn btn-action btn-outline-primary me-1"><i class="bi bi-pencil"></i></a>
+        <?php endif; ?>
+        <?php if (isAdmin()): ?>
+        <a href="fleet_fuel.php?delete=<?= $fe['id'] ?>&back=<?= $id ?>" onclick="return confirm('Delete this fuel entry?')" class="btn btn-action btn-outline-danger"><i class="bi bi-trash"></i></a>
+        <?php endif; ?>
+    </td>
+    <?php endif; ?>
+</tr>
+<?php endforeach; ?>
+</tbody>
+<tfoot class="table-light"><tr>
+    <td colspan="2" class="text-end fw-bold">Total</td>
+    <td class="text-end fw-bold"><?= number_format($total_fuel_litres,2) ?> L</td>
+    <td></td>
+    <td class="text-end fw-bold text-danger">₹<?= number_format($total_fuel_cost,2) ?></td>
+    <td colspan="<?= (canDo('fleet_fuel','update') || isAdmin()) ? 3 : 2 ?>"></td>
+</tr></tfoot>
+</table>
+</div></div>
+<?php else: ?>
+<div class="card-body text-muted text-center py-3">
+    <i class="bi bi-droplet me-2"></i>No fuel entries yet.
+    <?php if (canDo('fleet_fuel','create')): ?>
+    <a href="fleet_fuel.php?action=add&trip=<?= $id ?>&back=<?= $id ?>">Add first entry</a>
+    <?php endif; ?>
+</div>
+<?php endif; ?>
+</div></div>
+
+<!-- Trip P&L Summary -->
+<div class="col-12"><div class="card border-success">
+<div class="card-header" style="background:linear-gradient(135deg,#1a5632,#27ae60);color:#fff">
+    <i class="bi bi-graph-up me-2"></i>Trip P&amp;L Summary
+</div>
+<div class="card-body p-0"><div class="table-responsive">
+<table class="table table-sm mb-0">
+<tbody>
+    <tr class="table-success">
+        <td class="fw-bold ps-3" style="width:70%">Freight Income</td>
+        <td class="text-end pe-3 fw-bold text-success fs-6">₹<?= number_format($freight_income,2) ?></td>
+    </tr>
+    <tr>
+        <td class="ps-3 text-muted">Fuel Cost (<?= number_format($total_fuel_litres,2) ?> L)</td>
+        <td class="text-end pe-3 text-danger">− ₹<?= number_format($total_fuel_cost,2) ?></td>
+    </tr>
+    <tr>
+        <td class="ps-3 text-muted">Driver Advance</td>
+        <td class="text-end pe-3 text-danger">− ₹<?= number_format($driver_advance,2) ?></td>
+    </tr>
+    <tr class="table-light">
+        <td class="ps-3 fw-semibold">Total Expenses</td>
+        <td class="text-end pe-3 fw-semibold text-danger">₹<?= number_format($total_expenses,2) ?></td>
+    </tr>
+    <tr class="<?= $net_profit >= 0 ? 'table-success' : 'table-danger' ?>">
+        <td class="ps-3 fw-bold fs-6">Net Profit / Loss</td>
+        <td class="text-end pe-3 fw-bold fs-6 <?= $net_profit >= 0 ? 'text-success' : 'text-danger' ?>">
+            <?= $net_profit >= 0 ? '' : '− ' ?>₹<?= number_format(abs($net_profit),2) ?>
+        </td>
+    </tr>
+</tbody>
+</table>
+</div></div>
+</div></div>
+
 </div><!-- /row -->
 
 <?php
@@ -534,6 +708,7 @@ if ($id > 0) {
     $t = $db->query("SELECT * FROM fleet_trips WHERE id=$id LIMIT 1")->fetch_assoc() ?? [];
     $trip_items = $db->query("SELECT * FROM fleet_trip_items WHERE trip_id=$id ORDER BY id")->fetch_all(MYSQLI_ASSOC);
 }
+$is_completed = ($t['status'] ?? '') === 'Completed';
 ?>
 <div class="d-flex justify-content-between align-items-center mb-3">
     <h5 class="mb-0 fw-bold"><?= $id > 0 ? 'Edit' : 'New' ?> Trip Order</h5>
@@ -596,19 +771,20 @@ if ($id > 0) {
         </select>
     </div>
     <div class="col-12 col-md-3">
-        <label class="form-label">Customer / Buyer</label>
-        <select name="vendor_id" id="vendorSelect" class="form-select" onchange="fillFromVendor(this.value)">
-            <option value="">— Select Customer —</option>
+        <label class="form-label">Customer / Buyer <small class="text-muted fw-normal">(auto from PO)</small></label>
+        <select name="vendor_id" id="vendorSelect" class="form-select bg-light" disabled>
+            <option value="">— Select PO first —</option>
             <?php foreach ($vendors as $v): ?>
             <option value="<?= $v['id'] ?>" <?= ($t['vendor_id']??0)==$v['id']?'selected':'' ?>>
                 <?= htmlspecialchars($v['vendor_name']) ?>
             </option>
             <?php endforeach; ?>
         </select>
+        <input type="hidden" name="vendor_id" id="vendorIdHidden" value="<?= (int)($t['vendor_id']??0) ?>">
     </div>
     <div class="col-6 col-md-2">
         <label class="form-label">Status</label>
-        <select name="status" class="form-select">
+        <select name="status" class="form-select" id="statusSelect" onchange="onStatusChange(this.value)">
             <?php foreach (['Planned','In Transit','Completed','Cancelled'] as $s): ?>
             <option <?= ($t['status']??'Planned')===$s?'selected':'' ?>><?= $s ?></option>
             <?php endforeach; ?>
@@ -656,15 +832,29 @@ if ($id > 0) {
     </div>
     <div class="col-6 col-md-3">
         <label class="form-label">Source of Material (From)</label>
-        <select name="from_location" id="fromLocation" class="form-select" onchange="syncMTCFields()">
-            <option value="">— Select Source —</option>
-            <?php foreach ($sources_list as $src): ?>
-            <option value="<?= htmlspecialchars($src['source_name']) ?>"
-                <?= ($t['from_location']??'')===$src['source_name']?'selected':'' ?>>
-                <?= htmlspecialchars($src['source_name']) ?>
-            </option>
-            <?php endforeach; ?>
-        </select>
+        <div class="input-group">
+            <select name="from_location" id="fromLocation" class="form-select" onchange="syncMTCFields()">
+                <option value="">— Select Source —</option>
+                <?php foreach ($sources_list as $src): ?>
+                <option value="<?= htmlspecialchars($src['source_name']) ?>"
+                    <?= ($t['from_location']??'')===$src['source_name']?'selected':'' ?>>
+                    <?= htmlspecialchars($src['source_name']) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+            <button type="button" class="btn btn-outline-success" title="Add new source"
+                onclick="showAddSource()" style="white-space:nowrap">
+                <i class="bi bi-plus"></i>
+            </button>
+        </div>
+        <!-- Inline add source (hidden by default) -->
+        <div id="addSourceBox" class="mt-1 d-none">
+            <div class="input-group input-group-sm">
+                <input type="text" id="newSourceName" class="form-control" placeholder="New source name...">
+                <button type="button" class="btn btn-success" onclick="saveNewSource()">Save</button>
+                <button type="button" class="btn btn-outline-secondary" onclick="hideAddSource()">Cancel</button>
+            </div>
+        </div>
     </div>
     <div class="col-6 col-md-3">
         <label class="form-label">To Location</label>
@@ -713,7 +903,12 @@ if ($id > 0) {
     <td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" value="<?= htmlspecialchars($ti['uom']??'MT') ?>" readonly></td>
     <td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="<?= $ti['qty'] ?>" onchange="calcItemRow(this)"></td>
     <td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="<?= $ti['weight'] ?>" onchange="updateTotalWeight()"></td>
-    <td><input type="number" name="item_price[]" class="form-control form-control-sm item-price" step="0.01" value="<?= $ti['unit_price'] ?>" onchange="calcItemRow(this)"></td>
+    <td><input type="number" name="item_price[]"
+        class="form-control form-control-sm item-price <?= $is_completed ? 'bg-light' : '' ?>"
+        step="0.01"
+        value="<?= $is_completed ? $ti['unit_price'] : '' ?>"
+        <?= $is_completed ? 'readonly' : 'onchange="calcItemRow(this)"' ?>
+        placeholder="<?= $is_completed ? '' : 'After delivery' ?>"></td>
     <td><input type="text" name="item_amount[]" class="form-control form-control-sm bg-light item-amt" readonly value="<?= $ti['amount'] ?>"></td>
     <td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeItemRow(this)"><i class="bi bi-x"></i></button></td>
 </tr>
@@ -731,7 +926,7 @@ if ($id > 0) {
     <td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" readonly></td>
     <td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="0" onchange="calcItemRow(this)"></td>
     <td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight()"></td>
-    <td><input type="number" name="item_price[]" class="form-control form-control-sm item-price" step="0.01" value="0" onchange="calcItemRow(this)"></td>
+    <td><input type="number" name="item_price[]" class="form-control form-control-sm item-price" step="0.01" value="" onchange="calcItemRow(this)" placeholder="After delivery"></td>
     <td><input type="text" name="item_amount[]" class="form-control form-control-sm bg-light item-amt" readonly value="0.00"></td>
     <td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeItemRow(this)"><i class="bi bi-x"></i></button></td>
 </tr>
@@ -874,41 +1069,95 @@ if ($id > 0) {
 const poVendorMap  = <?= json_encode($po_vendor_map,   JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
 const poAddrMap    = <?= json_encode($po_addr_map,     JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
 const poRateMap    = <?= json_encode($po_rate_map,     JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
+const poItemsMap   = <?= json_encode($po_items_map,   JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
 const vendorDataMap= <?= json_encode($vendor_data_map, JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
 const vehDriverMap = <?= json_encode($veh_driver_map,  JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
+const itemsMasterList = <?= json_encode(array_map(fn($i) => ['id'=>$i['id'],'item_name'=>$i['item_name'],'uom'=>$i['uom']], $items_list), JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
+const isCompleted  = <?= $is_completed ? 'true' : 'false' ?>;
 
-/* ── PO selected → auto-fill vendor + delivery address + freight rate ── */
+/* ── PO selected → auto-fill vendor + delivery address + items ── */
 function fillFromPO(poId) {
     poId = parseInt(poId) || 0;
     if (!poId) return;
+
     // Set vendor dropdown
     var vid = poVendorMap[poId] || 0;
     if (vid) {
         var vSel = document.getElementById('vendorSelect');
         if (vSel) { vSel.value = vid; fillFromVendor(vid); }
     }
+
     // Set To Location from PO delivery address
     var addr = poAddrMap[poId] || '';
     if (addr) {
         var toEl = document.querySelector('[name="to_location"]');
         if (toEl && !toEl.value) toEl.value = addr;
     }
-    // Set rate in all item rows
+
+    // Set rate
     var rate = poRateMap[poId] || 0;
     window._poFreightRate = rate;
-    if (rate > 0) {
+
+    // Auto-populate items from PO (greyed out, readonly)
+    var items = poItemsMap[poId] || [];
+    if (items.length > 0) {
+        var tbody = document.getElementById('itemsBody');
+        tbody.innerHTML = '';
+        items.forEach(function(item) {
+            tbody.appendChild(makePOItemRow(item.item_name, item.uom, item.unit_price));
+        });
+    } else if (rate > 0) {
+        // No items in PO but has rate — set rate on existing rows
         document.querySelectorAll('.item-price').forEach(function(el) {
             el.value = rate.toFixed(2);
         });
-        calcItemsTotal();
     }
+    calcItemsTotal();
+    syncMTCFields();
     calcFreightFromWeight();
+}
+
+/* ── Make a PO-sourced item row (readonly name/uom, rate pre-filled) ── */
+function makePOItemRow(itemName, uom, rate) {
+    var tr = document.createElement('tr');
+    tr.className = 'item-row';
+    var opts = '<option value="">— Select —</option>';
+    // Pre-select matching item from items_list if possible
+    var matchId = '';
+    if (typeof itemsMasterList !== 'undefined') {
+        itemsMasterList.forEach(function(il) {
+            opts += '<option value="' + il.id + '" data-name="' + il.item_name + '" data-uom="' + il.uom + '"' +
+                (il.item_name === itemName ? ' selected' : '') + '>' + il.item_name + '</option>';
+            if (il.item_name === itemName) matchId = il.id;
+        });
+    }
+    tr.innerHTML =
+        '<td>' +
+            '<select name="item_id[]" class="form-select form-select-sm bg-light" onchange="fillItemUom(this)" style="color:#555">' + opts + '</select>' +
+            '<input type="hidden" name="item_name[]" class="item-name-hidden" value="' + itemName + '">' +
+        '</td>' +
+        '<td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" value="' + uom + '" readonly></td>' +
+        '<td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="0" onchange="calcItemRow(this)" required></td>' +
+        '<td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight()"></td>' +
+        '<td><input type="number" name="item_price[]" class="form-control form-control-sm item-price' +
+            (isCompleted ? ' bg-light' : '') + '" step="0.01" value="' +
+            (isCompleted ? (rate||0).toFixed(2) : '') + '" ' +
+            (isCompleted ? 'readonly' : 'onchange="calcItemRow(this)" placeholder="After delivery"') + '></td>' +
+        '<td><input type="text" name="item_amount[]" class="form-control form-control-sm bg-light item-amt" readonly value="0.00"></td>' +
+        '<td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeItemRow(this)"><i class="bi bi-x"></i></button></td>';
+    return tr;
 }
 
 /* ── Vendor selected → auto-fill consignee ── */
 function fillFromVendor(vid) {
     vid = parseInt(vid) || 0;
     var data = vendorDataMap[vid] || {};
+    // Update visible disabled select + hidden input
+    var vSel = document.getElementById('vendorSelect');
+    var vHid = document.getElementById('vendorIdHidden');
+    if (vSel) vSel.value = vid;
+    if (vHid) vHid.value = vid;
+    // Fill hidden consignee fields
     document.getElementById('custName').value  = data.name    || '';
     document.getElementById('custAddr').value  = data.address || '';
     document.getElementById('custCity').value  = data.city    || '';
@@ -974,21 +1223,27 @@ function calcItemsTotal() {
     document.getElementById('itemsTotal').textContent = '₹' + total.toFixed(2);
 }
 
-/* ── Add item row ── */
+/* ── Add item row (manual — rate editable) ── */
 function addItemRow() {
     var tbody = document.getElementById('itemsBody');
-    var tmpl  = tbody.querySelector('.item-row');
-    var tr    = tmpl.cloneNode(true);
-    tr.querySelector('select').selectedIndex = 0;
-    tr.querySelectorAll('input[type="number"]').forEach(function(i) { i.value = '0'; });
-    tr.querySelectorAll('input[type="text"]').forEach(function(i) { i.value = ''; });
-    tr.querySelectorAll('input[type="hidden"]').forEach(function(i) { i.value = ''; });
-    // Pre-fill rate from current PO
-    var rate = window._poFreightRate || 0;
-    if (rate > 0) {
-        var priceEl = tr.querySelector('.item-price');
-        if (priceEl) priceEl.value = rate.toFixed(2);
+    var rate  = window._poFreightRate || 0;
+    var tr    = document.createElement('tr');
+    tr.className = 'item-row';
+    var opts = '<option value="">— Select —</option>';
+    if (typeof itemsMasterList !== 'undefined') {
+        itemsMasterList.forEach(function(il) {
+            opts += '<option value="' + il.id + '" data-name="' + il.item_name + '" data-uom="' + il.uom + '">' + il.item_name + '</option>';
+        });
     }
+    tr.innerHTML =
+        '<td><select name="item_id[]" class="form-select form-select-sm" onchange="fillItemUom(this)">' + opts + '</select>' +
+        '<input type="hidden" name="item_name[]" class="item-name-hidden" value=""></td>' +
+        '<td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" readonly></td>' +
+        '<td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="0" onchange="calcItemRow(this)" required></td>' +
+        '<td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight()"></td>' +
+        '<td><input type="number" name="item_price[]" class="form-control form-control-sm item-price" step="0.01" value="" onchange="calcItemRow(this)" placeholder="After delivery"></td>' +
+        '<td><input type="text" name="item_amount[]" class="form-control form-control-sm bg-light item-amt" readonly value="0.00"></td>' +
+        '<td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeItemRow(this)"><i class="bi bi-x"></i></button></td>';
     tbody.appendChild(tr);
 }
 
@@ -1020,6 +1275,65 @@ function syncMTCFields() {
     var tripDate = document.querySelector('[name="trip_date"]');
     var dateEl   = document.getElementById('mtcTestDate');
     if (tripDate && dateEl && tripDate.value) dateEl.value = tripDate.value;
+}
+
+/* ── Status changed → auto-populate rate when Completed ── */
+function onStatusChange(status) {
+    var rate = window._poFreightRate || 0;
+    var priceEls = document.querySelectorAll('.item-price');
+    if (status === 'Completed' && rate > 0) {
+        priceEls.forEach(function(el) {
+            el.value = rate.toFixed(2);
+            el.readOnly = true;
+            el.classList.add('bg-light');
+            el.removeAttribute('placeholder');
+            el.removeAttribute('onchange');
+            el.addEventListener('change', function() { calcItemRow(this); });
+        });
+        calcItemsTotal();
+        calcFreightFromWeight();
+    } else if (status !== 'Completed') {
+        priceEls.forEach(function(el) {
+            el.readOnly = false;
+            el.classList.remove('bg-light');
+            el.placeholder = 'After delivery';
+        });
+    }
+}
+
+/* ── Add new source of material inline ── */
+function showAddSource() {
+    document.getElementById('addSourceBox').classList.remove('d-none');
+    document.getElementById('newSourceName').focus();
+}
+function hideAddSource() {
+    document.getElementById('addSourceBox').classList.add('d-none');
+    document.getElementById('newSourceName').value = '';
+}
+function saveNewSource() {
+    var name = document.getElementById('newSourceName').value.trim();
+    if (!name) { alert('Please enter a source name.'); return; }
+    fetch('fleet_trips.php?ajax=add_source', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'source_name=' + encodeURIComponent(name)
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            var sel = document.getElementById('fromLocation');
+            var opt = document.createElement('option');
+            opt.value = data.source_name;
+            opt.text  = data.source_name;
+            opt.selected = true;
+            sel.appendChild(opt);
+            hideAddSource();
+            syncMTCFields();
+        } else {
+            alert('Error: ' + (data.error || 'Failed to save source.'));
+        }
+    })
+    .catch(e => alert('Network error: ' + e.message));
 }
 
 /* ── Init ── */

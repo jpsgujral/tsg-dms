@@ -163,10 +163,10 @@ $modules_base = $in_modules ? '' : 'modules/';
 
     /* ═══════════════════════ TOPBAR ═══════════════════════════ */
     .topbar {
-        background: #fff;
+        background: linear-gradient(135deg, var(--primary), #2d6b3f);
         height: var(--topbar-h);
         padding: 0 20px;
-        box-shadow: 0 2px 12px rgba(0,0,0,.07);
+        box-shadow: 0 2px 12px rgba(0,0,0,.2);
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -176,14 +176,14 @@ $modules_base = $in_modules ? '' : 'modules/';
         flex-shrink: 0;
     }
     .topbar-left { display: flex; align-items: center; gap: 12px; }
-    .topbar h4  { margin: 0; font-size: 1rem; color: var(--primary); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw; }
+    .topbar h4  { margin: 0; font-size: 1rem; color: #fff; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55vw; }
 
     /* Hamburger toggle — hidden on desktop, visible on mobile */
     .sidebar-toggle {
         display: none;
-        background: none;
+        background: rgba(255,255,255,.15);
         border: none;
-        color: var(--primary);
+        color: #fff;
         font-size: 1.4rem;
         padding: 4px 6px;
         border-radius: 6px;
@@ -191,10 +191,10 @@ $modules_base = $in_modules ? '' : 'modules/';
         line-height: 1;
         flex-shrink: 0;
     }
-    .sidebar-toggle:hover { background: var(--light-bg); }
+    .sidebar-toggle:hover { background: rgba(255,255,255,.25); }
 
     .topbar-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-    .topbar-date  { font-size: 0.75rem; color: #888; }
+    .topbar-date  { font-size: 0.75rem; color: rgba(255,255,255,.75); }
 
     /* ═══════════════════════ CONTENT AREA ═════════════════════ */
     .content-area {
@@ -375,9 +375,9 @@ $modules_base = $in_modules ? '' : 'modules/';
             position: fixed;
             bottom: 0; left: 0; right: 0;
             height: 58px;
-            background: #fff;
-            border-top: 1px solid #e0ede5;
-            box-shadow: 0 -2px 12px rgba(0,0,0,.08);
+            background: linear-gradient(135deg, var(--primary), #2d6b3f);
+            border-top: 2px solid rgba(255,255,255,.15);
+            box-shadow: 0 -3px 16px rgba(0,0,0,.25);
             z-index: 1030;
             align-items: stretch;
             padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -389,7 +389,7 @@ $modules_base = $in_modules ? '' : 'modules/';
             align-items: center;
             justify-content: center;
             gap: 2px;
-            color: #888;
+            color: rgba(255,255,255,.65);
             text-decoration: none;
             font-size: .6rem;
             font-weight: 600;
@@ -397,16 +397,22 @@ $modules_base = $in_modules ? '' : 'modules/';
             text-transform: uppercase;
             transition: color .15s, background .15s;
             border-radius: 0;
+            border-right: 1px solid rgba(255,255,255,.1);
         }
+        .bottom-nav a:last-child { border-right: none; }
         .bottom-nav a i { font-size: 1.2rem; }
-        .bottom-nav a:hover,
-        .bottom-nav a.active { color: var(--primary); background: #f0f8f3; }
+        .bottom-nav a:hover { color: #fff; background: rgba(255,255,255,.1); }
+        .bottom-nav a.active {
+            color: #fff;
+            background: rgba(255,255,255,.15);
+            border-top: 3px solid #2ecc71;
+        }
         .bottom-nav a.add-btn {
             color: #fff;
-            background: var(--primary);
-            border-radius: 0;
+            background: #27ae60;
+            border-right: 1px solid rgba(255,255,255,.1);
         }
-        .bottom-nav a.add-btn:hover { background: var(--secondary); color: #fff; }
+        .bottom-nav a.add-btn:hover { background: #2ecc71; }
         .bottom-nav a.add-btn i { font-size: 1.5rem; }
     }
 
@@ -500,6 +506,7 @@ function closeSidebar() {
         'companies.php'            => 'settings',
         'company_settings.php'     => 'settings',
         'users.php'                => 'settings',
+        'error_log.php'               => 'settings',
     ];
     // backup/index.php maps to settings section
     if ($in_backup && $current_page === 'index.php') {
@@ -696,6 +703,22 @@ function closeSidebar() {
     <a href="<?= $base ?><?= $backup_base ?>index.php" class="nav-link <?= ($in_backup && $current_page=='index.php')?'active':'' ?>">
         <i class="bi bi-cloud-arrow-up"></i><span>Backup &amp; Restore</span>
     </a>
+    <a href="<?= $modules_base ?>error_log.php" class="nav-link <?= $current_page=='error_log.php'?'active':'' ?>">
+        <i class="bi bi-bug"></i><span>Error Log
+        <?php
+        $db->query("CREATE TABLE IF NOT EXISTS app_error_log (
+            id INT AUTO_INCREMENT PRIMARY KEY, logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            level VARCHAR(20), message VARCHAR(1000), file VARCHAR(255), line INT DEFAULT 0,
+            url VARCHAR(500), user_id INT DEFAULT 0, trace TEXT, resolved TINYINT DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        $err_count = $db->query("SELECT COUNT(*) c FROM app_error_log WHERE resolved=0 LIMIT 1");
+        if ($err_count) {
+            $ec = (int)$err_count->fetch_assoc()['c'];
+            if ($ec > 0) echo '<span class="badge bg-danger ms-1" style="font-size:.65rem">'.$ec.'</span>';
+        }
+        ?>
+        </span>
+    </a>
     <?php navSectionEnd(); ?>
     <?php endif; ?>
 
@@ -717,14 +740,14 @@ function closeSidebar() {
         <div class="topbar-right">
             <span class="topbar-date d-none d-sm-inline"><?= date('d M Y') ?></span>
             <div class="dropdown">
-                <button class="btn btn-sm btn-outline-secondary d-flex align-items-center gap-2"
+                <button class="btn btn-sm d-flex align-items-center gap-2"
                         type="button" data-bs-toggle="dropdown" aria-expanded="false"
-                        style="border-radius:20px;padding:4px 12px">
+                        style="border-radius:20px;padding:4px 12px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff">
                     <span class="d-flex align-items-center justify-content-center rounded-circle text-white fw-bold"
                           style="width:26px;height:26px;font-size:.75rem;background:linear-gradient(135deg,#1a5632,#27ae60)">
                         <?= strtoupper(substr($_SESSION['full_name']??$_SESSION['username']??'U',0,1)) ?>
                     </span>
-                    <span class="d-none d-md-inline" style="font-size:.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                    <span class="d-none d-md-inline" style="font-size:.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fff">
                         <?= htmlspecialchars($_SESSION['full_name'] ?? $_SESSION['username'] ?? 'User') ?>
                     </span>
                     <?php if (isAdmin()): ?><span class="badge bg-danger" style="font-size:.6rem">Admin</span><?php endif; ?>
