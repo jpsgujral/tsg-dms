@@ -601,7 +601,7 @@ foreach ($copies as $idx => $copyLabel):
         </div>
         <div class="sig-box">
             <?php
-            $cb_img = $company['seal_path'] ?? '';
+            $cb_img = $company['mtc_sig_path'] ?? '';
             if ($cb_img): ?>
             <div style="text-align:center;padding:3px 0">
                 <img src="<?= img_display_url($cb_img) ?>" alt="Checked By"
