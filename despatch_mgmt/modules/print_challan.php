@@ -278,11 +278,15 @@ function cleanAddress($str) {
         }
         .sig-box {
             flex: 1;
-            padding: 30px 15px 10px;
+            padding: 10px 15px 10px;
             border-right: 1.5px solid #1a5632;
             text-align: center;
             font-size: 8pt;
-            min-height: 70px;
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
         }
         .sig-box:last-child { border-right: none; }
         .sig-box .sig-title {
@@ -293,6 +297,7 @@ function cleanAddress($str) {
             letter-spacing: 0.5px;
             border-top: 1px solid #999;
             padding-top: 5px;
+            width: 100%;
         }
 
         /* Footer note */

@@ -1,6 +1,7 @@
 <?php
 require_once '../includes/config.php';
 require_once '../includes/auth.php';
+if (file_exists('../includes/r2_helper.php')) require_once '../includes/r2_helper.php';
 $db = getDB();
 requirePerm('fleet_purchase_orders', 'view');
 
@@ -103,6 +104,15 @@ if (isset($_GET['delete']) && isAdmin()) {
 }
 
 /* ── Save ── */
+/* ── Auto-add po_document column if missing ── */
+(function($db){
+    $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+    $exists = $db->query("SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_purchase_orders'
+        AND COLUMN_NAME='po_document' LIMIT 1")->num_rows;
+    if (!$exists) $db->query("ALTER TABLE fleet_purchase_orders ADD COLUMN po_document VARCHAR(255) DEFAULT NULL");
+})($db);
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_po'])) {
     requirePerm('fleet_purchase_orders', $id > 0 ? 'update' : 'create');
     $po_no    = sanitize($_POST['po_number'] ?? '');
@@ -158,21 +168,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_po'])) {
         redirect("fleet_purchase_orders.php?action=".($id>0?"edit&id=$id":'add'));
     }
 
+    /* ── Handle PO document upload via R2 ── */
+    $po_doc_sql = '';
+    $old_po_doc = $id > 0 ? ($db->query("SELECT po_document FROM fleet_purchase_orders WHERE id=$id LIMIT 1")->fetch_assoc()['po_document'] ?? '') : '';
+    if (!empty($_POST['delete_po_document']) && $old_po_doc) {
+        r2_delete($old_po_doc);
+        $po_doc_sql = ", po_document=NULL";
+        $old_po_doc = '';
+    }
+    $new_key = r2_handle_upload('po_document', 'po_docs/po', $old_po_doc);
+    if ($new_key) {
+        $po_doc_sql = ", po_document='".$db->real_escape_string($new_key)."'";
+        $doc_path   = $new_key;
+    }
+
     if ($id > 0) {
         $db->query("UPDATE fleet_purchase_orders SET
             po_number='$po_no', po_date='$po_date', vendor_id=$vend_id, validity_date=$val_sql,
             delivery_address='$del_addr', payment_terms='$pay_terms', gst_type='$gst_type',
             subtotal=$subtotal, gst_amount=$gst_total, total_amount=$grand_total,
-            status='$status', remarks='$remarks'
+            status='$status', remarks='$remarks'$po_doc_sql
             WHERE id=$id");
         $db->query("DELETE FROM fleet_po_items WHERE po_id=$id");
     } else {
         $uid = (int)($_SESSION['user_id'] ?? 0);
+        $doc_col = $po_doc_sql ? ',po_document' : '';
+        $doc_val = isset($doc_path) ? (",'".$db->real_escape_string($doc_path)."'") : '';
         $db->query("INSERT INTO fleet_purchase_orders
             (po_number,po_date,vendor_id,validity_date,delivery_address,payment_terms,gst_type,
-             subtotal,gst_amount,total_amount,status,remarks,created_by,company_id)
+             subtotal,gst_amount,total_amount,status,remarks,created_by,company_id$doc_col)
             VALUES ('$po_no','$po_date',$vend_id,$val_sql,'$del_addr','$pay_terms','$gst_type',
-            $subtotal,$gst_total,$grand_total,'$status','$remarks',$uid,$co_id)");
+            $subtotal,$gst_total,$grand_total,'$status','$remarks',$uid,$co_id$doc_val)");
         $id = $db->insert_id;
     }
 
@@ -204,7 +230,12 @@ $status_colors = ['Draft'=>'secondary','Approved'=>'success','Partially Received
 
 /* ── LIST ── */
 if ($action === 'list'):
-$pos = $db->query("SELECT p.*, v.vendor_name, co.company_name FROM fleet_purchase_orders p
+$pos = $db->query("SELECT p.*, v.vendor_name, co.company_name,
+    COALESCE((SELECT SUM(pi.qty) FROM fleet_po_items pi WHERE pi.po_id=p.id),0) AS po_qty,
+    COALESCE((SELECT SUM(ti.weight) FROM fleet_trip_items ti
+              JOIN fleet_trips t ON ti.trip_id=t.id
+              WHERE t.po_id=p.id AND t.status NOT IN ('Cancelled')),0) AS despatched_qty
+    FROM fleet_purchase_orders p
     LEFT JOIN fleet_customers_master v ON p.vendor_id=v.id
     LEFT JOIN companies co ON p.company_id=co.id
     ORDER BY co.company_name ASC, p.po_date DESC, p.id DESC")->fetch_all(MYSQLI_ASSOC);
@@ -249,17 +280,25 @@ foreach ($pos as $p) $counts[$p['status']] = ($counts[$p['status']] ?? 0) + 1;
 <table class="table table-hover mb-0 fpo-table">
 <thead><tr>
     <th>PO No</th><th>Date</th><th>Customer / Buyer</th><th>Payment Terms</th>
+    <th class="text-end">PO Qty (MT)</th><th class="text-end">Despatched (MT)</th><th class="text-end">Balance (MT)</th>
     <th class="text-end">Amount</th><th>Status</th><th>Actions</th>
 </tr></thead>
 <tbody>
 <?php foreach ($list as $p):
     $sc = $status_colors[$p['status']] ?? 'secondary';
+    $po_qty   = (float)($p['po_qty'] ?? 0);
+    $desp_qty = (float)($p['despatched_qty'] ?? 0);
+    $bal_qty  = $po_qty - $desp_qty;
+    $bal_color = $bal_qty <= 0 ? 'text-success' : ($desp_qty > 0 ? 'text-warning' : 'text-muted');
 ?>
 <tr data-status="<?= $p['status'] ?>">
     <td><strong><?= htmlspecialchars($p['po_number']) ?></strong></td>
     <td><?= date('d/m/Y', strtotime($p['po_date'])) ?></td>
     <td><?= htmlspecialchars($p['vendor_name'] ?? '—') ?></td>
     <td><?= htmlspecialchars($p['payment_terms'] ?: '—') ?></td>
+    <td class="text-end"><?= number_format($po_qty, 3) ?></td>
+    <td class="text-end"><?= number_format($desp_qty, 3) ?></td>
+    <td class="text-end fw-bold <?= $bal_color ?>"><?= number_format($bal_qty, 3) ?></td>
     <td class="text-end">₹<?= number_format($p['total_amount'], 2) ?></td>
     <td><span class="badge bg-<?= $sc ?>"><?= $p['status'] ?></span></td>
     <td>
@@ -394,6 +433,14 @@ if (isset($_GET['approve']) && canDo('fleet_purchase_orders','update')) {
 <?php if ($po['remarks']): ?>
 <div class="col-12"><div class="card"><div class="card-body"><strong>Remarks:</strong> <?= htmlspecialchars($po['remarks']) ?></div></div></div>
 <?php endif; ?>
+<?php if (!empty($po['po_document'])): ?>
+<div class="col-12"><div class="card"><div class="card-body">
+    <strong><i class="bi bi-paperclip me-1"></i>PO Document:</strong>
+    <a href="<?= htmlspecialchars(r2_url($po['po_document'])) ?>" target="_blank" class="btn btn-outline-success btn-sm ms-2">
+        <i class="bi bi-file-earmark-arrow-down me-1"></i>View / Download
+    </a>
+</div></div></div>
+<?php endif; ?>
 </div>
 
 <?php
@@ -422,7 +469,7 @@ foreach ($vendors_raw as $v) {
     <h5 class="mb-0 fw-bold"><?= $id > 0 ? 'Edit' : 'New' ?> Customer PO</h5>
     <a href="fleet_purchase_orders.php" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Back</a>
 </div>
-<form method="POST">
+<form method="POST" enctype="multipart/form-data">
 <input type="hidden" name="save_po" value="1">
 <div class="row g-3">
 
@@ -559,6 +606,24 @@ foreach ($vendors_raw as $v) {
 <div class="col-12"><div class="card"><div class="card-body">
     <label class="form-label">Remarks</label>
     <textarea name="remarks" class="form-control" rows="2"><?= htmlspecialchars($po['remarks'] ?? '') ?></textarea>
+</div></div></div>
+
+<div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-paperclip me-2"></i>PO Document (PDF / Image)</div>
+<div class="card-body">
+    <?php $cur_doc = $po['po_document'] ?? ''; ?>
+    <?php if ($cur_doc): ?>
+    <div class="mb-2">
+        <a href="<?= htmlspecialchars(r2_url($cur_doc)) ?>" target="_blank" class="btn btn-outline-success btn-sm">
+            <i class="bi bi-file-earmark-arrow-down me-1"></i>View Current Document
+        </a>
+        <label class="ms-3 form-check-label text-danger">
+            <input type="checkbox" name="delete_po_document" value="1" class="form-check-input me-1">
+            Remove document
+        </label>
+    </div>
+    <?php endif; ?>
+    <input type="file" name="po_document" class="form-control" accept=".pdf,.jpg,.jpeg,.png,.webp">
+    <div class="form-text">Accepted: PDF, JPG, PNG, WEBP (max 5MB)</div>
 </div></div></div>
 
 <div class="col-12 text-end">

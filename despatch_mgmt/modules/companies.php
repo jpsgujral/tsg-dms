@@ -97,7 +97,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $sql = "UPDATE companies SET ".implode(',',$parts)." WHERE id=$id";
         $db->query($sql);
         showAlert('success', 'Company updated successfully.');
-        redirect('companies.php?action=edit&id='.$id); // go back to edit so user sees saved data
+        redirect('companies.php');
     } else {
         $cols2=[]; $vals2=[];
         foreach ($data as $k=>$v) {
@@ -106,7 +106,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $db->query("INSERT INTO companies (".implode(',',$cols2).") VALUES (".implode(',',$vals2).")");
         $new_id = $db->insert_id;
         showAlert('success', 'Company added successfully.');
-        redirect('companies.php?action=edit&id='.$new_id);
+        redirect('companies.php');
     }
 }
 

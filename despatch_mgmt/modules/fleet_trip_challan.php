@@ -1,6 +1,7 @@
 <?php
 require_once '../includes/config.php';
 require_once '../includes/auth.php';
+if (file_exists('../includes/r2_helper.php')) require_once '../includes/r2_helper.php';
 $db = getDB();
 $id = (int)($_GET['id'] ?? 0);
 if (!$id) die('Invalid trip ID.');
@@ -27,6 +28,34 @@ if (!$t) die('Trip not found.');
 
 $trip_items = $db->query("SELECT * FROM fleet_trip_items WHERE trip_id=$id ORDER BY id")->fetch_all(MYSQLI_ASSOC);
 $company    = getCompany();
+
+/* ── Fetch supervisor signature from app_users ── */
+$auth_sig_path = '';
+if (!empty($t['supervisor_id'])) {
+    // Try to find app_user linked to supervisor by matching name
+    $sup_user = $db->query("SELECT signature_path FROM app_users
+        WHERE status='Active' AND signature_path IS NOT NULL AND signature_path != ''
+        ORDER BY id LIMIT 1")->fetch_assoc();
+    if ($sup_user) $auth_sig_path = $sup_user['signature_path'];
+}
+// Fallback — any active user with a signature
+if (!$auth_sig_path) {
+    $any_sig = $db->query("SELECT signature_path FROM app_users
+        WHERE status='Active' AND signature_path IS NOT NULL AND signature_path != ''
+        ORDER BY id LIMIT 1")->fetch_assoc();
+    if ($any_sig) $auth_sig_path = $any_sig['signature_path'];
+}
+
+/* ── Image helper ── */
+function fleetImgUrl(string $path): string {
+    if (empty($path)) return '';
+    if (strpos($path, 'uploads/') === 0) {
+        $rel = substr($path, strlen('uploads/'));
+        return '../modules/img.php?f=' . urlencode($rel);
+    }
+    if (function_exists('r2_url')) return r2_url($path);
+    return '../uploads/' . $path;
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -190,17 +219,24 @@ table.items tfoot td {
 }
 .sign-box {
     flex: 1;
-    padding: 30px 15px 10px;
+    padding: 10px 15px 10px;
     border-right: 1.5px solid #1a5632;
     text-align: center;
     font-size: 8pt;
-    min-height: 70px;
+    min-height: 80px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
 }
 .sign-box:last-child { border-right: none; }
 .sign-box .sig-title {
     font-size: 8pt;
     color: #333;
     font-weight: bold;
+    border-top: 1px solid #999;
+    padding-top: 5px;
+    width: 100%;
 }
 .sign-box small { font-weight: normal; color: #555; display: block; margin-top: 3px; }
 
@@ -439,10 +475,18 @@ function printPDF() {
         <small><?= esc($t['driver_name']) ?></small>
     </div>
     <div class="sign-box">
+        <?php if ($auth_sig_path): ?>
+        <img src="<?= fleetImgUrl($auth_sig_path) ?>" alt="Signature"
+             style="max-height:45px;max-width:120px;object-fit:contain;display:block;margin:0 auto 4px">
+        <?php endif; ?>
         <div class="sig-title">Supervisor / Authorised By</div>
         <?php if ($t['supervisor_name']): ?><small><?= esc($t['supervisor_name']) ?></small><?php endif; ?>
     </div>
     <div class="sign-box">
+        <?php if (!empty($company['seal_path'])): ?>
+        <img src="<?= fleetImgUrl($company['seal_path']) ?>" alt="Company Seal"
+             style="max-height:55px;max-width:80px;object-fit:contain;display:block;margin:0 auto 4px;opacity:.85">
+        <?php endif; ?>
         <div class="sig-title">Consignee Signature</div>
         <small>(Goods Received in Good Condition)</small>
     </div>
@@ -543,12 +587,22 @@ function printPDF() {
 <!-- MTC Signatures -->
 <div style="display:flex;justify-content:space-between;margin-top:20mm">
     <div style="text-align:center;width:45%">
+        <?php if ($auth_sig_path): ?>
+        <img src="<?= fleetImgUrl($auth_sig_path) ?>" alt="Signature"
+             style="max-height:50px;max-width:130px;object-fit:contain;display:block;margin:0 auto 6px">
+        <?php else: ?>
         <div style="border:1px dashed #aaa;min-height:55px;background:#fafafa;margin-bottom:6px"></div>
+        <?php endif; ?>
         <div style="font-size:10px;font-weight:600">For <?= esc($company['company_name']??'') ?></div>
         <div style="font-size:10px;color:#555">(Manager Technical)</div>
     </div>
     <div style="text-align:center;width:45%">
+        <?php if (!empty($company['seal_path'])): ?>
+        <img src="<?= fleetImgUrl($company['seal_path']) ?>" alt="Company Seal"
+             style="max-height:60px;max-width:90px;object-fit:contain;display:block;margin:0 auto 6px;opacity:.85">
+        <?php else: ?>
         <div style="border:1px dashed #aaa;min-height:55px;background:#fafafa;margin-bottom:6px"></div>
+        <?php endif; ?>
         <div style="font-size:10px;color:#555">Company Seal</div>
     </div>
 </div>

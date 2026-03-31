@@ -1,6 +1,7 @@
 <?php
 require_once '../includes/config.php';
 require_once '../includes/auth.php';
+if (file_exists('../includes/r2_helper.php')) require_once '../includes/r2_helper.php';
 $db = getDB();
 requirePerm('fleet_fuel', 'view');
 
@@ -24,10 +25,15 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_fuel_log (
 /* ── Auto-migrate: add trip_id if missing ── */
 (function($db){
     $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
-    $exists = $db->query("SELECT 1 FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_fuel_log'
-        AND COLUMN_NAME='trip_id' LIMIT 1")->num_rows;
-    if (!$exists) $db->query("ALTER TABLE fleet_fuel_log ADD COLUMN trip_id INT DEFAULT NULL AFTER driver_id");
+    foreach ([
+        'trip_id'        => "INT DEFAULT NULL AFTER driver_id",
+        'fuel_bill_path' => "VARCHAR(255) DEFAULT NULL",
+    ] as $col => $def) {
+        $exists = $db->query("SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_fuel_log'
+            AND COLUMN_NAME='$col' LIMIT 1")->num_rows;
+        if (!$exists) $db->query("ALTER TABLE fleet_fuel_log ADD COLUMN `$col` $def");
+    }
 })($db);
 
 $action = $_GET['action'] ?? 'list';
@@ -65,19 +71,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_fuel'])) {
         redirect("fleet_fuel.php?action=".($id>0?"edit&id=$id":'add'));
     }
 
+    /* ── Handle fuel bill upload via R2 ── */
+    $bill_path_sql  = '';
+    $old_bill_path  = $id > 0 ? ($db->query("SELECT fuel_bill_path FROM fleet_fuel_log WHERE id=$id LIMIT 1")->fetch_assoc()['fuel_bill_path'] ?? '') : '';
+    if (!empty($_POST['delete_fuel_bill']) && $old_bill_path) {
+        r2_delete($old_bill_path);
+        $bill_path_sql = ", fuel_bill_path=NULL";
+        $old_bill_path = '';
+    }
+    $new_bill_key = r2_handle_upload('fuel_bill', 'fuel_bills/fuel', $old_bill_path);
+    if ($new_bill_key) {
+        $fuel_bill_path = $new_bill_key;
+        $bill_path_sql  = ", fuel_bill_path='".$db->real_escape_string($new_bill_key)."'";
+    }
+
     if ($id > 0) {
         $db->query("UPDATE fleet_fuel_log SET fuel_company_id=$fc_id, vehicle_id=$veh_id,
             driver_id=$drv_sql, trip_id=$trip_sql, fuel_date='$date', litres=$litres,
             rate_per_litre=$rate, amount=$amount, odometer=$odo,
-            payment_mode='$mode', bill_no='$bill', notes='$notes'
+            payment_mode='$mode', bill_no='$bill', notes='$notes'$bill_path_sql
             WHERE id=$id");
         showAlert('success','Fuel entry updated.');
     } else {
+        $doc_col = $bill_path_sql ? ',fuel_bill_path' : '';
+        $doc_val = isset($fuel_bill_path) ? (",'".$db->real_escape_string($fuel_bill_path)."'") : '';
         $db->query("INSERT INTO fleet_fuel_log
             (fuel_company_id,vehicle_id,driver_id,trip_id,fuel_date,litres,rate_per_litre,
-             amount,odometer,payment_mode,bill_no,notes)
+             amount,odometer,payment_mode,bill_no,notes$doc_col)
             VALUES ($fc_id,$veh_id,$drv_sql,$trip_sql,'$date',$litres,$rate,
-            $amount,$odo,'$mode','$bill','$notes')");
+            $amount,$odo,'$mode','$bill','$notes'$doc_val)");
         showAlert('success','Fuel entry added.');
     }
     // Return to trip view if came from there
@@ -192,7 +214,13 @@ foreach ($entries as $e) {
     <td class="text-end">₹<?= number_format($e['rate_per_litre'],2) ?></td>
     <td class="text-end fw-bold">₹<?= number_format($e['amount'],2) ?></td>
     <td><span class="badge bg-<?= $e['payment_mode']==='Credit'?'warning text-dark':'success' ?>"><?= $e['payment_mode'] ?></span></td>
-    <td><?= htmlspecialchars($e['bill_no']??'—') ?></td>
+    <td><?= htmlspecialchars($e['bill_no']??'—') ?>
+        <?php if (!empty($e['fuel_bill_path'])): ?>
+        <a href="<?= htmlspecialchars(r2_url($e['fuel_bill_path'])) ?>" target="_blank" class="ms-1" title="View Bill">
+            <i class="bi bi-file-earmark-text text-success"></i>
+        </a>
+        <?php endif; ?>
+    </td>
     <td>
         <?php if (canDo('fleet_fuel','update')): ?>
         <a href="?action=edit&id=<?= $e['id'] ?>" class="btn btn-action btn-outline-primary me-1"><i class="bi bi-pencil"></i></a>
@@ -232,7 +260,7 @@ if ($prefill_trip) {
         <i class="bi bi-arrow-left me-1"></i>Back
     </a>
 </div>
-<form method="POST">
+<form method="POST" enctype="multipart/form-data">
 <input type="hidden" name="save_fuel" value="1">
 <input type="hidden" name="back" value="<?= $back ?: ($prefill_trip ?: '') ?>">
 <div class="row g-3">
@@ -322,6 +350,22 @@ if ($prefill_trip) {
     <div class="col-12 col-md-5">
         <label class="form-label">Notes / Remarks</label>
         <input type="text" name="notes" class="form-control" value="<?= htmlspecialchars($e['notes']??'') ?>" placeholder="e.g. Before loading, After loading, Extra due to overload">
+    </div>
+    <div class="col-12 col-md-4">
+        <label class="form-label">Fuel Bill (PDF / Image)</label>
+        <?php $cur_bill = $e['fuel_bill_path'] ?? ''; ?>
+        <?php if ($cur_bill): ?>
+        <div class="mb-1">
+            <a href="<?= htmlspecialchars(r2_url($cur_bill)) ?>" target="_blank" class="btn btn-outline-success btn-sm">
+                <i class="bi bi-file-earmark-arrow-down me-1"></i>View Current Bill
+            </a>
+            <label class="ms-2 text-danger small">
+                <input type="checkbox" name="delete_fuel_bill" value="1" class="form-check-input me-1">Remove
+            </label>
+        </div>
+        <?php endif; ?>
+        <input type="file" name="fuel_bill" class="form-control form-control-sm" accept=".pdf,.jpg,.jpeg,.png,.webp">
+        <div class="form-text">PDF, JPG, PNG (max 5MB)</div>
     </div>
 </div></div></div></div>
 <div class="col-12 text-end">

@@ -2,6 +2,7 @@
 ob_start();
 require_once '../includes/config.php';
 require_once '../includes/auth.php';
+if (file_exists('../includes/r2_helper.php')) require_once '../includes/r2_helper.php';
 $db = getDB();
 
 /* ── AJAX: Add new source of material ── */
@@ -52,6 +53,46 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'add_source' && $_SERVER['REQUEST_
 }
 
 requirePerm('fleet_trips', 'view');
+
+/* ── AJAX: Upload trip document ── */
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'upload_doc') {
+    ob_clean();
+    header('Content-Type: application/json');
+    $trip_id = (int)($_POST['trip_id'] ?? 0);
+    if (!$trip_id || empty($_FILES['doc_file']['name']) || $_FILES['doc_file']['error'] !== UPLOAD_ERR_OK) {
+        echo json_encode(['success'=>false,'error'=>'Invalid request or no file.']); exit;
+    }
+    $db      = getDB();
+    $r2_key  = r2_handle_upload('doc_file', 'trip_docs/trip_'.$trip_id);
+    if (!$r2_key) {
+        echo json_encode(['success'=>false,'error'=>'Upload failed. Check file type (PDF/JPG/PNG/WEBP, max 10MB).']); exit;
+    }
+    $doc_type = $db->real_escape_string(sanitize($_POST['doc_type'] ?? 'Other'));
+    $doc_name = $db->real_escape_string(sanitize($_POST['doc_name'] ?? $_FILES['doc_file']['name']));
+    $r2_esc   = $db->real_escape_string($r2_key);
+    $uid      = (int)($_SESSION['user_id'] ?? 0);
+    $db->query("INSERT INTO fleet_trip_documents (trip_id,doc_type,doc_name,file_path,uploaded_by)
+        VALUES ($trip_id,'$doc_type','$doc_name','$r2_esc',$uid)");
+    $new_id = $db->insert_id;
+    echo json_encode(['success'=>true,'id'=>$new_id,'r2_key'=>$r2_key,'url'=>r2_url($r2_key),'doc_type'=>$doc_type,'doc_name'=>$doc_name]);
+    exit;
+}
+
+/* ── AJAX: Delete trip document ── */
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'delete_doc') {
+    ob_clean();
+    header('Content-Type: application/json');
+    $doc_id = (int)($_POST['doc_id'] ?? 0);
+    if (!$doc_id) { echo json_encode(['success'=>false]); exit; }
+    $db  = getDB();
+    $doc = $db->query("SELECT * FROM fleet_trip_documents WHERE id=$doc_id LIMIT 1")->fetch_assoc();
+    if ($doc) {
+        r2_delete($doc['file_path']);
+        $db->query("DELETE FROM fleet_trip_documents WHERE id=$doc_id");
+    }
+    echo json_encode(['success'=>true]);
+    exit;
+}
 
 /* ── Safe ALTER helper ── */
 function fleetSafeAddCol($db, $table, $col, $def) {
@@ -123,6 +164,18 @@ fleetSafeAddCol($db, 'fleet_trips', 'mtc_loi',       "VARCHAR(30) DEFAULT ''");
 fleetSafeAddCol($db, 'fleet_trips', 'mtc_fineness',  "VARCHAR(30) DEFAULT ''");
 fleetSafeAddCol($db, 'fleet_trips', 'mtc_remarks',   "VARCHAR(255) DEFAULT ''");
 fleetSafeAddCol($db, 'fleet_trips', 'company_id',    'INT DEFAULT 1');
+
+/* ── Trip Documents table ── */
+$db->query("CREATE TABLE IF NOT EXISTS fleet_trip_documents (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    trip_id     INT NOT NULL,
+    doc_type    VARCHAR(80) DEFAULT 'Other',
+    doc_name    VARCHAR(255),
+    file_path   VARCHAR(255) NOT NULL,
+    uploaded_by INT DEFAULT 0,
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_trip (trip_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
 $db->query("CREATE TABLE IF NOT EXISTS fleet_trip_items (
     id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -232,7 +285,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_trip'])) {
     /* Items */
     $item_ids   = $_POST['item_id']     ?? [];
     $item_names = $_POST['item_name']   ?? [];
-    $item_qtys  = $_POST['item_qty']    ?? [];
     $item_uoms  = $_POST['item_uom']    ?? [];
     $item_prices= $_POST['item_price']  ?? [];
     $item_wts   = $_POST['item_weight'] ?? [];
@@ -241,16 +293,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_trip'])) {
     foreach ($item_names as $idx => $iname) {
         $iname = trim($iname);
         if (!$iname) continue;
-        $qty   = (float)($item_qtys[$idx]   ?? 0);
-        $price = (float)($item_prices[$idx] ?? 0);
         $wt    = (float)($item_wts[$idx]    ?? 0);
-        $amt   = round($qty * $price, 2);
+        $price = (float)($item_prices[$idx] ?? 0);
+        $amt   = round($wt * $price, 2);
         $subtotal     += $amt;
         $total_weight += $wt;
         $valid_items[] = [
             'item_id'   => (int)($item_ids[$idx] ?? 0),
             'item_name' => $db->real_escape_string($iname),
-            'qty'       => $qty,
+            'qty'       => $wt, // qty = weight for fly ash
             'uom'       => $db->real_escape_string($item_uoms[$idx] ?? 'MT'),
             'unit_price'=> $price,
             'weight'    => $wt,
@@ -326,14 +377,26 @@ $pos       = $db->query("SELECT p.id,p.po_number,p.vendor_id,p.delivery_address 
 $items_list= $db->query("SELECT id,item_code,item_name,uom FROM items WHERE status='Active' ORDER BY item_name")->fetch_all(MYSQLI_ASSOC);
 $sources_list = $db->query("SELECT id,source_name FROM source_of_material WHERE status='Active' ORDER BY source_name")->fetch_all(MYSQLI_ASSOC);
 
-/* Vehicle → Driver map: use most recent trip per vehicle to suggest driver */
+/* Vehicle → Driver map: use default_driver_id from vehicle master first,
+   fall back to most recent trip driver if not set */
 $veh_driver_map = [];
-$vd_res = $db->query("SELECT vehicle_id, driver_id FROM fleet_trips
-    WHERE driver_id IS NOT NULL AND driver_id > 0
-    GROUP BY vehicle_id HAVING MAX(id)
-    ORDER BY MAX(id) DESC");
+// Primary: default driver set in vehicle master
+$vd_res = $db->query("SELECT id AS vehicle_id, default_driver_id AS driver_id
+    FROM fleet_vehicles WHERE default_driver_id IS NOT NULL AND default_driver_id > 0");
 if ($vd_res) while ($vdr = $vd_res->fetch_assoc()) {
-    if (!isset($veh_driver_map[$vdr['vehicle_id']])) {
+    $veh_driver_map[(int)$vdr['vehicle_id']] = (int)$vdr['driver_id'];
+}
+// Fallback: most recent trip driver for vehicles without a default set
+$vd_res2 = $db->query("SELECT t1.vehicle_id, t1.driver_id
+    FROM fleet_trips t1
+    INNER JOIN (
+        SELECT vehicle_id, MAX(id) AS max_id FROM fleet_trips
+        WHERE driver_id IS NOT NULL AND driver_id > 0
+        GROUP BY vehicle_id
+    ) t2 ON t1.vehicle_id=t2.vehicle_id AND t1.id=t2.max_id");
+if ($vd_res2) while ($vdr = $vd_res2->fetch_assoc()) {
+    // Only add if not already set from vehicle master
+    if (!isset($veh_driver_map[(int)$vdr['vehicle_id']])) {
         $veh_driver_map[(int)$vdr['vehicle_id']] = (int)$vdr['driver_id'];
     }
 }
@@ -444,6 +507,9 @@ foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;
         <?php if (canDo('fleet_trips','update') && !in_array($t['status'],['Completed','Cancelled'])): ?>
         <a href="?action=edit&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-primary me-1" title="Edit"><i class="bi bi-pencil"></i></a>
         <?php endif; ?>
+        <?php if ($t['status'] === 'Completed'): ?>
+        <a href="?action=docs&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-primary me-1" title="Manage Documents"><i class="bi bi-paperclip"></i></a>
+        <?php endif; ?>
         <a href="fleet_trip_challan.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-action btn-outline-success me-1" title="Print"><i class="bi bi-printer"></i></a>
         <a href="export_trip_pdf.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-action btn-outline-danger me-1" title="PDF"><i class="bi bi-file-earmark-pdf"></i></a>
         <?php if (isAdmin() && $t['status'] === 'Planned'): ?>
@@ -500,6 +566,9 @@ $sc  = $status_colors[$t['status']] ?? 'secondary';
         <?php if (canDo('fleet_trips','update') && !in_array($t['status'],['Completed','Cancelled'])): ?>
         <a href="?action=edit&id=<?= $id ?>" class="btn btn-outline-primary btn-sm"><i class="bi bi-pencil me-1"></i>Edit</a>
         <?php endif; ?>
+        <?php if ($t['status'] === 'Completed'): ?>
+        <a href="?action=docs&id=<?= $id ?>" class="btn btn-outline-primary btn-sm"><i class="bi bi-paperclip me-1"></i>Manage Documents</a>
+        <?php endif; ?>
         <a href="fleet_trips.php" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Back</a>
     </div>
 </div>
@@ -524,14 +593,13 @@ $sc  = $status_colors[$t['status']] ?? 'secondary';
 <div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-list-ul me-2"></i>Items / Materials</div>
 <div class="card-body p-0"><div class="table-responsive">
 <table class="table table-sm mb-0">
-<thead class="table-light"><tr><th>#</th><th>Item</th><th>UOM</th><th class="text-end">Qty</th><th class="text-end">Weight (MT)</th><th class="text-end">Rate</th><th class="text-end">Amount</th></tr></thead>
+<thead class="table-light"><tr><th>#</th><th>Item</th><th>UOM</th><th class="text-end">Weight (MT)</th><th class="text-end">Rate</th><th class="text-end">Amount</th></tr></thead>
 <tbody>
 <?php $ri=1; foreach ($trip_items as $ti): ?>
 <tr>
     <td><?= $ri++ ?></td>
     <td><?= htmlspecialchars($ti['item_name']) ?></td>
     <td><?= htmlspecialchars($ti['uom']) ?></td>
-    <td class="text-end"><?= number_format($ti['qty'],3) ?></td>
     <td class="text-end"><?= number_format($ti['weight'],3) ?></td>
     <td class="text-end">₹<?= number_format($ti['unit_price'],2) ?></td>
     <td class="text-end"><strong>₹<?= number_format($ti['amount'],2) ?></strong></td>
@@ -539,7 +607,7 @@ $sc  = $status_colors[$t['status']] ?? 'secondary';
 <?php endforeach; ?>
 </tbody>
 <tfoot class="table-light"><tr>
-    <td colspan="4" class="text-end fw-bold">Total</td>
+    <td colspan="3" class="text-end fw-bold">Total</td>
     <td class="text-end fw-bold"><?= number_format((float)($t['total_weight']??0),3) ?> MT</td>
     <td></td>
     <td class="text-end fw-bold">₹<?= number_format($t['subtotal'],2) ?></td>
@@ -589,11 +657,29 @@ $fuel_entries = $db->query("SELECT fl.*, fc.company_name AS fuel_company
 $total_fuel_litres = array_sum(array_column($fuel_entries, 'litres'));
 $total_fuel_cost   = array_sum(array_column($fuel_entries, 'amount'));
 
+/* ── Vehicle expenses for this trip ── */
+// Auto-add trip_id column if missing (in case fleet_expenses.php hasn't been loaded yet)
+(function($db){
+    $dbname = $db->query("SELECT DATABASE()")->fetch_row()[0];
+    $exists = $db->query("SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_expenses'
+        AND COLUMN_NAME='trip_id' LIMIT 1")->num_rows;
+    if (!$exists) $db->query("ALTER TABLE fleet_expenses ADD COLUMN trip_id INT DEFAULT NULL AFTER vehicle_id");
+})($db);
+$veh_expenses = $db->query("SELECT * FROM fleet_expenses WHERE trip_id=$id ORDER BY expense_date ASC, id ASC")->fetch_all(MYSQLI_ASSOC);
+$total_veh_exp = array_sum(array_column($veh_expenses, 'amount'));
+
 /* ── P&L ── */
 $freight_income  = (float)($t['freight_amount'] ?? 0);
 $driver_advance  = (float)($t['driver_advance']  ?? 0);
-$total_expenses  = $total_fuel_cost + $driver_advance;
-$net_profit      = $freight_income - $total_expenses;
+// Income = sum of item amounts (rate × weight) if available, else freight_amount from trip
+$trip_items_pl   = $db->query("SELECT SUM(weight) as tw, SUM(amount) as ta FROM fleet_trip_items WHERE trip_id=$id")->fetch_assoc();
+$total_weight_pl = (float)($trip_items_pl['tw'] ?? 0);
+$items_total     = (float)($trip_items_pl['ta'] ?? 0);
+// Use items total if rate has been entered (amount > 0), otherwise fall back to freight_amount
+$rate_income     = $items_total > 0 ? $items_total : $freight_income;
+$total_expenses  = $total_fuel_cost + $driver_advance + $total_veh_exp;
+$net_profit      = $rate_income - $total_expenses;
 ?>
 
 <!-- Fuel Entries -->
@@ -629,7 +715,13 @@ $net_profit      = $freight_income - $total_expenses;
     <td class="text-end">₹<?= number_format($fe['rate_per_litre'],2) ?></td>
     <td class="text-end fw-bold">₹<?= number_format($fe['amount'],2) ?></td>
     <td><span class="badge bg-<?= $fe['payment_mode']==='Credit'?'warning text-dark':'success' ?>"><?= $fe['payment_mode'] ?></span></td>
-    <td><small class="text-muted"><?= htmlspecialchars($fe['notes']??'') ?></small></td>
+    <td><small class="text-muted"><?= htmlspecialchars($fe['notes']??'') ?></small>
+        <?php if (!empty($fe['fuel_bill_path'])): ?>
+        <a href="<?= htmlspecialchars(r2_url($fe['fuel_bill_path'])) ?>" target="_blank" class="ms-1" title="View Fuel Bill">
+            <i class="bi bi-file-earmark-text text-success"></i>
+        </a>
+        <?php endif; ?>
+    </td>
     <?php if (canDo('fleet_fuel','update') || isAdmin()): ?>
     <td>
         <?php if (canDo('fleet_fuel','update')): ?>
@@ -662,6 +754,95 @@ $net_profit      = $freight_income - $total_expenses;
 <?php endif; ?>
 </div></div>
 
+<!-- Vehicle Expenses -->
+<div class="col-12"><div class="card">
+<div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-tools me-2 text-secondary"></i>Vehicle Expenses
+        <?php if ($total_veh_exp > 0): ?>
+        <span class="badge bg-danger ms-2">₹<?= number_format($total_veh_exp,2) ?></span>
+        <?php endif; ?>
+    </span>
+    <?php if (canDo('fleet_expenses','create')): ?>
+    <a href="fleet_expenses.php?action=add&trip=<?= $id ?>&back=<?= $id ?>" class="btn btn-secondary btn-sm">
+        <i class="bi bi-plus-circle me-1"></i>Add Expense
+    </a>
+    <?php endif; ?>
+</div>
+<?php if ($veh_expenses): ?>
+<div class="card-body p-0"><div class="table-responsive">
+<table class="table table-sm mb-0">
+<thead class="table-secondary"><tr>
+    <th>Date</th><th>Type</th><th>Vendor</th><th>Description</th>
+    <th class="text-end">Amount</th><th>Mode</th>
+    <?php if (canDo('fleet_expenses','update') || isAdmin()): ?><th></th><?php endif; ?>
+</tr></thead>
+<tbody>
+<?php foreach ($veh_expenses as $ve): ?>
+<tr>
+    <td><?= date('d/m/Y',strtotime($ve['expense_date'])) ?></td>
+    <td><span class="badge bg-secondary"><?= htmlspecialchars($ve['expense_type']) ?></span></td>
+    <td><?= htmlspecialchars($ve['vendor_name']??'—') ?></td>
+    <td><small class="text-muted"><?= htmlspecialchars($ve['description']??'') ?></small></td>
+    <td class="text-end fw-bold">₹<?= number_format($ve['amount'],2) ?></td>
+    <td><?= htmlspecialchars($ve['payment_mode']) ?></td>
+    <?php if (canDo('fleet_expenses','update') || isAdmin()): ?>
+    <td>
+        <?php if (canDo('fleet_expenses','update')): ?>
+        <a href="fleet_expenses.php?action=edit&id=<?= $ve['id'] ?>&back=<?= $id ?>" class="btn btn-action btn-outline-primary me-1"><i class="bi bi-pencil"></i></a>
+        <?php endif; ?>
+        <?php if (isAdmin()): ?>
+        <a href="fleet_expenses.php?delete=<?= $ve['id'] ?>&back=<?= $id ?>" onclick="return confirm('Delete this expense?')" class="btn btn-action btn-outline-danger"><i class="bi bi-trash"></i></a>
+        <?php endif; ?>
+    </td>
+    <?php endif; ?>
+</tr>
+<?php endforeach; ?>
+</tbody>
+<tfoot class="table-light"><tr>
+    <td colspan="4" class="text-end fw-bold">Total</td>
+    <td class="text-end fw-bold text-danger">₹<?= number_format($total_veh_exp,2) ?></td>
+    <td colspan="<?= (canDo('fleet_expenses','update') || isAdmin()) ? 2 : 1 ?>"></td>
+</tr></tfoot>
+</table>
+</div></div>
+<?php else: ?>
+<div class="card-body text-muted text-center py-3">
+    <i class="bi bi-tools me-2"></i>No vehicle expenses linked to this trip.
+    <?php if (canDo('fleet_expenses','create')): ?>
+    <a href="fleet_expenses.php?action=add&trip=<?= $id ?>&back=<?= $id ?>">Add expense</a>
+    <?php endif; ?>
+</div>
+<?php endif; ?>
+</div></div>
+
+<?php
+/* ── Trip Documents ── */
+$view_docs = $db->query("SELECT * FROM fleet_trip_documents WHERE trip_id=$id ORDER BY uploaded_at ASC")->fetch_all(MYSQLI_ASSOC);
+if ($view_docs):
+?>
+<div class="col-12"><div class="card">
+<div class="card-header"><i class="bi bi-paperclip me-2"></i>Trip Documents
+    <span class="badge bg-primary ms-2"><?= count($view_docs) ?></span>
+</div>
+<div class="card-body">
+    <div class="d-flex flex-wrap gap-3">
+    <?php foreach ($view_docs as $doc): ?>
+    <a href="<?= htmlspecialchars(r2_url($doc['file_path'])) ?>" target="_blank"
+       class="d-flex align-items-center gap-2 text-decoration-none border rounded px-3 py-2"
+       style="font-size:.85rem">
+        <?php $ext = strtolower(pathinfo($doc['file_path'],PATHINFO_EXTENSION)); ?>
+        <i class="bi bi-file-earmark-<?= $ext==='pdf'?'pdf text-danger':'image text-primary' ?> fs-4"></i>
+        <div>
+            <div class="fw-semibold"><?= htmlspecialchars($doc['doc_name']) ?></div>
+            <div class="text-muted" style="font-size:.75rem"><?= htmlspecialchars($doc['doc_type']) ?></div>
+        </div>
+    </a>
+    <?php endforeach; ?>
+    </div>
+</div>
+</div></div>
+<?php endif; ?>
+
 <!-- Trip P&L Summary -->
 <div class="col-12"><div class="card border-success">
 <div class="card-header" style="background:linear-gradient(135deg,#1a5632,#27ae60);color:#fff">
@@ -671,16 +852,25 @@ $net_profit      = $freight_income - $total_expenses;
 <table class="table table-sm mb-0">
 <tbody>
     <tr class="table-success">
-        <td class="fw-bold ps-3" style="width:70%">Freight Income</td>
-        <td class="text-end pe-3 fw-bold text-success fs-6">₹<?= number_format($freight_income,2) ?></td>
+        <td class="fw-bold ps-3" style="width:65%">
+            Freight Income
+            <?php if ($total_weight_pl > 0): ?>
+            <small class="text-muted fw-normal">(<?= number_format($total_weight_pl,3) ?> MT)</small>
+            <?php endif; ?>
+        </td>
+        <td class="text-end pe-3 fw-bold text-success fs-6">₹<?= number_format($rate_income,2) ?></td>
     </tr>
     <tr>
-        <td class="ps-3 text-muted">Fuel Cost (<?= number_format($total_fuel_litres,2) ?> L)</td>
+        <td class="ps-3 text-muted">Fuel Cost <small>(<?= number_format($total_fuel_litres,2) ?> L)</small></td>
         <td class="text-end pe-3 text-danger">− ₹<?= number_format($total_fuel_cost,2) ?></td>
     </tr>
     <tr>
         <td class="ps-3 text-muted">Driver Advance</td>
         <td class="text-end pe-3 text-danger">− ₹<?= number_format($driver_advance,2) ?></td>
+    </tr>
+    <tr>
+        <td class="ps-3 text-muted">Vehicle Expenses</td>
+        <td class="text-end pe-3 text-danger">− ₹<?= number_format($total_veh_exp,2) ?></td>
     </tr>
     <tr class="table-light">
         <td class="ps-3 fw-semibold">Total Expenses</td>
@@ -714,13 +904,18 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
     <h5 class="mb-0 fw-bold"><?= $id > 0 ? 'Edit' : 'New' ?> Trip Order</h5>
     <a href="fleet_trips.php" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Back</a>
 </div>
-<form method="POST" id="tripForm">
+<form method="POST" id="tripForm" enctype="multipart/form-data">
 <input type="hidden" name="save_trip" value="1">
 <?php if ($id > 0): ?><input type="hidden" name="trip_no" value="<?= htmlspecialchars($t['trip_no']) ?>"><?php endif; ?>
 <div class="row g-3">
 
 <!-- Trip Information -->
-<div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-signpost-split me-2"></i>Trip Information</div>
+<div class="col-12"><div class="card <?= $is_completed ? 'border-secondary opacity-75' : '' ?>">
+<div class="card-header <?= $is_completed ? 'bg-secondary text-white' : '' ?>">
+    <i class="bi bi-signpost-split me-2"></i>Trip Information
+    <?php if ($is_completed): ?><span class="ms-2 small"><i class="bi bi-lock-fill me-1"></i>Locked — Trip Completed</span><?php endif; ?>
+</div>
+<fieldset <?= $is_completed ? 'disabled style="pointer-events:none;opacity:.7"' : '' ?>>
 <div class="card-body"><div class="row g-3">
     <?php if (count($all_companies) > 1): ?>
     <div class="col-6 col-md-2">
@@ -803,14 +998,21 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
     </div>
     <div class="col-12 col-md-3">
         <label class="form-label fw-bold">Driver *</label>
-        <select name="driver_id" id="driverSelect" class="form-select" required>
+        <select name="driver_id" id="driverSelect" class="form-select" required onchange="showDriverName(this)">
             <option value="">— Select Driver —</option>
             <?php foreach ($drivers as $d): ?>
-            <option value="<?= $d['id'] ?>" <?= ($t['driver_id']??0)==$d['id']?'selected':'' ?>>
+            <option value="<?= $d['id'] ?>" data-name="<?= htmlspecialchars($d['full_name']) ?>" data-phone="<?= htmlspecialchars($d['phone']??'') ?>" <?= ($t['driver_id']??0)==$d['id']?'selected':'' ?>>
                 <?= htmlspecialchars($d['full_name']) ?> (<?= $d['role'] ?>)
             </option>
             <?php endforeach; ?>
         </select>
+        <div id="driverNameTag" class="mt-1 text-muted" style="font-size:.82rem">
+            <?php
+            $sel_driver = array_filter($drivers, fn($d) => $d['id'] == ($t['driver_id']??0));
+            $sel_driver = reset($sel_driver);
+            if ($sel_driver) echo '<i class="bi bi-person-fill me-1"></i>'.htmlspecialchars($sel_driver['full_name']);
+            ?>
+        </div>
     </div>
     <div class="col-12 col-md-3">
         <label class="form-label">Supervisor</label>
@@ -861,6 +1063,7 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
         <input type="text" name="to_location" class="form-control" value="<?= htmlspecialchars($t['to_location']??'') ?>">
     </div>
 </div></div></div></div>
+<?php if ($is_completed): ?></fieldset><?php endif; ?>
 
 <!-- Consignee -->
 <!-- Hidden consignee fields - auto-populated from vendor but not shown -->
@@ -871,16 +1074,21 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
 <input type="hidden" name="customer_address" id="custAddr" value="<?= htmlspecialchars($t['customer_address']??'') ?>">
 
 <!-- Items -->
-<div class="col-12"><div class="card"><div class="card-header d-flex justify-content-between align-items-center">
-    <span><i class="bi bi-list-ul me-2"></i>Items / Materials</span>
+<div class="col-12"><div class="card <?= $is_completed ? 'border-secondary opacity-75' : '' ?>">
+<div class="card-header d-flex justify-content-between align-items-center <?= $is_completed ? 'bg-secondary text-white' : '' ?>">
+    <span><i class="bi bi-list-ul me-2"></i>Items / Materials
+        <?php if ($is_completed): ?><span class="ms-2 small"><i class="bi bi-lock-fill me-1"></i>Locked</span><?php endif; ?>
+    </span>
+    <?php if (!$is_completed): ?>
     <button type="button" class="btn btn-success btn-sm" onclick="addItemRow()"><i class="bi bi-plus-circle me-1"></i>Add Item</button>
+    <?php endif; ?>
 </div>
+<fieldset <?= $is_completed ? 'disabled style="pointer-events:none;opacity:.7"' : '' ?>>
 <div class="card-body p-0"><div class="table-responsive">
 <table class="table table-sm mb-0" id="itemsTable">
 <thead class="table-light"><tr>
     <th>Item</th><th>UOM</th>
-    <th style="width:90px">Qty</th>
-    <th style="width:100px">Weight (MT)</th>
+    <th style="width:120px">Weight (MT)</th>
     <th style="width:110px">Rate (₹/MT)</th>
     <th style="width:110px">Amount (₹)</th>
     <th style="width:36px"></th>
@@ -901,8 +1109,7 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
         <input type="hidden" name="item_name[]" class="item-name-hidden" value="<?= htmlspecialchars($ti['item_name']) ?>">
     </td>
     <td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" value="<?= htmlspecialchars($ti['uom']??'MT') ?>" readonly></td>
-    <td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="<?= $ti['qty'] ?>" onchange="calcItemRow(this)"></td>
-    <td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="<?= $ti['weight'] ?>" onchange="updateTotalWeight()"></td>
+    <td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="<?= $ti['weight'] ?>" onchange="updateTotalWeight(); calcItemRow(this)"></td>
     <td><input type="number" name="item_price[]"
         class="form-control form-control-sm item-price <?= $is_completed ? 'bg-light' : '' ?>"
         step="0.01"
@@ -924,8 +1131,7 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
         <input type="hidden" name="item_name[]" class="item-name-hidden" value="">
     </td>
     <td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" readonly></td>
-    <td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="0" onchange="calcItemRow(this)"></td>
-    <td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight()"></td>
+    <td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight(); calcItemRow(this)"></td>
     <td><input type="number" name="item_price[]" class="form-control form-control-sm item-price" step="0.01" value="" onchange="calcItemRow(this)" placeholder="After delivery"></td>
     <td><input type="text" name="item_amount[]" class="form-control form-control-sm bg-light item-amt" readonly value="0.00"></td>
     <td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeItemRow(this)"><i class="bi bi-x"></i></button></td>
@@ -934,7 +1140,7 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
 </tbody>
 <tfoot class="table-light">
     <tr>
-        <td colspan="3" class="text-end fw-bold">Total Weight:</td>
+        <td colspan="2" class="text-end fw-bold">Total Weight:</td>
         <td><input type="number" name="total_weight" id="totalWeight" class="form-control form-control-sm bg-light fw-bold" readonly value="<?= $t['total_weight']??0 ?>"></td>
         <td class="text-end fw-bold">Total:</td>
         <td><strong id="itemsTotal">₹0.00</strong></td>
@@ -943,6 +1149,7 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
 </tfoot>
 </table>
 </div></div></div></div>
+<?php if ($is_completed): ?></fieldset><?php endif; ?>
 
 <!-- Hidden financial fields — kept for DB compatibility -->
 <input type="hidden" name="freight_amount" id="freightAmount" value="<?= $t['freight_amount']??0 ?>">
@@ -1007,7 +1214,7 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
                 </span>
             </label>
             <input type="date" name="mtc_test_date" id="mtcTestDate" class="form-control bg-light"
-                   readonly tabindex="-1" value="<?= htmlspecialchars($t['mtc_test_date'] ?: ($t['trip_date'] ?? date('Y-m-d'))) ?>">
+                   readonly tabindex="-1" value="<?= htmlspecialchars(($t['mtc_test_date'] ?? '') ?: ($t['trip_date'] ?? date('Y-m-d'))) ?>">
         </div>
     </div>
     <h6 class="fw-bold mt-3 mb-2 text-warning"><i class="bi bi-table me-1"></i>Test Results</h6>
@@ -1051,11 +1258,24 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
 </div>
 </div>
 
-<!-- Remarks -->
-<div class="col-12"><div class="card"><div class="card-body">
-    <label class="form-label">Remarks</label>
-    <textarea name="remarks" class="form-control" rows="2"><?= htmlspecialchars($t['remarks']??'') ?></textarea>
+<!-- Trip Documents -->
+<!-- Trip Documents -->
+<?php if ($id > 0 && ($t['status']??'') === 'Completed'): ?>
+<div class="col-12"><div class="card border-primary"><div class="card-body text-center py-3">
+    <i class="bi bi-paperclip fs-4 text-primary me-2"></i>
+    <a href="?action=docs&id=<?= $id ?>" class="btn btn-outline-primary">
+        <i class="bi bi-paperclip me-1"></i>Manage Trip Documents
+    </a>
 </div></div></div>
+<?php elseif ($id > 0): ?>
+<div class="col-12"><div class="card"><div class="card-body text-muted">
+    <i class="bi bi-lock me-1"></i>Document upload available after trip is marked <strong>Completed</strong>.
+</div></div></div>
+<?php else: ?>
+<div class="col-12"><div class="card"><div class="card-body text-muted">
+    <i class="bi bi-paperclip me-1"></i>Save the trip first to manage documents.
+</div></div></div>
+<?php endif; ?>
 
 <div class="col-12 text-end">
     <a href="fleet_trips.php" class="btn btn-outline-secondary me-2">Cancel</a>
@@ -1137,8 +1357,7 @@ function makePOItemRow(itemName, uom, rate) {
             '<input type="hidden" name="item_name[]" class="item-name-hidden" value="' + itemName + '">' +
         '</td>' +
         '<td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" value="' + uom + '" readonly></td>' +
-        '<td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="0" onchange="calcItemRow(this)" required></td>' +
-        '<td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight()"></td>' +
+        '<td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight(); calcItemRow(this)"></td>' +
         '<td><input type="number" name="item_price[]" class="form-control form-control-sm item-price' +
             (isCompleted ? ' bg-light' : '') + '" step="0.01" value="' +
             (isCompleted ? (rate||0).toFixed(2) : '') + '" ' +
@@ -1165,16 +1384,31 @@ function fillFromVendor(vid) {
     document.getElementById('custGst').value   = data.gstin   || '';
 }
 
+/* ── Driver selected → show name in grey ── */
+function showDriverName(sel) {
+    var opt  = sel.options[sel.selectedIndex];
+    var name = opt ? (opt.getAttribute('data-name') || '') : '';
+    var tag  = document.getElementById('driverNameTag');
+    if (tag) tag.innerHTML = name ? '<i class="bi bi-person-fill me-1"></i>' + name : '';
+}
+
 /* ── Vehicle selected → auto-fill driver ── */
 function fillDriverFromVehicle(vid) {
     vid = parseInt(vid) || 0;
     var did = vehDriverMap[vid] || 0;
     var dSel = document.getElementById("driverSelect");
-    if (did && dSel) {
+    if (!dSel) return;
+    if (did) {
         dSel.value = did;
         dSel.style.background = "#f0f8f3";
         dSel.title = "Auto-filled from last trip for this vehicle — change if needed";
+    } else {
+        // No previous driver for this vehicle — clear the selection
+        dSel.value = '';
+        dSel.style.background = '';
+        dSel.title = '';
     }
+    showDriverName(dSel);
 }
 
 /* ── Item selected → fill UOM + name ── */
@@ -1193,9 +1427,9 @@ function fillItemUom(sel) {
 /* ── Row calculations ── */
 function calcItemRow(el) {
     var tr  = el.closest('tr');
-    var qty = parseFloat(tr.querySelector('.item-qty').value)   || 0;
-    var prc = parseFloat(tr.querySelector('.item-price').value) || 0;
-    tr.querySelector('.item-amt').value = (qty * prc).toFixed(2);
+    var wt  = parseFloat(tr.querySelector('.item-wt').value)    || 0;
+    var prc = parseFloat(tr.querySelector('.item-price').value)  || 0;
+    tr.querySelector('.item-amt').value = (wt * prc).toFixed(2);
     calcItemsTotal();
 }
 
@@ -1239,8 +1473,7 @@ function addItemRow() {
         '<td><select name="item_id[]" class="form-select form-select-sm" onchange="fillItemUom(this)">' + opts + '</select>' +
         '<input type="hidden" name="item_name[]" class="item-name-hidden" value=""></td>' +
         '<td><input type="text" name="item_uom[]" class="form-control form-control-sm bg-light item-uom" readonly></td>' +
-        '<td><input type="number" name="item_qty[]" class="form-control form-control-sm item-qty" step="0.001" value="0" onchange="calcItemRow(this)" required></td>' +
-        '<td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight()"></td>' +
+        '<td><input type="number" name="item_weight[]" class="form-control form-control-sm item-wt" step="0.001" value="0" onchange="updateTotalWeight(); calcItemRow(this)"></td>' +
         '<td><input type="number" name="item_price[]" class="form-control form-control-sm item-price" step="0.01" value="" onchange="calcItemRow(this)" placeholder="After delivery"></td>' +
         '<td><input type="text" name="item_amount[]" class="form-control form-control-sm bg-light item-amt" readonly value="0.00"></td>' +
         '<td><button type="button" class="btn btn-outline-danger btn-sm" onclick="removeItemRow(this)"><i class="bi bi-x"></i></button></td>';
@@ -1348,6 +1581,140 @@ syncMTCFields();
 // Re-sync MTC when trip date changes
 var tripDateEl = document.querySelector('[name="trip_date"]');
 if (tripDateEl) tripDateEl.addEventListener('change', syncMTCFields);
+</script>
+<?php endif; ?>
+
+<?php
+/* ══════════════════════════════════
+   DOCS ACTION — Manage Documents only
+══════════════════════════════════ */
+if ($action === 'docs' && $id > 0):
+    $t = $db->query("SELECT * FROM fleet_trips WHERE id=$id LIMIT 1")->fetch_assoc();
+    if (!$t || $t['status'] !== 'Completed') {
+        showAlert('danger','Documents can only be managed for Completed trips.');
+        redirect('fleet_trips.php');
+    }
+    $trip_docs = $db->query("SELECT * FROM fleet_trip_documents WHERE trip_id=$id ORDER BY uploaded_at ASC")->fetch_all(MYSQLI_ASSOC);
+?>
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0 fw-bold">
+        <i class="bi bi-paperclip me-2"></i>Trip Documents
+        <span class="badge bg-success ms-2"><?= htmlspecialchars($t['trip_no']) ?></span>
+    </h5>
+    <a href="?action=view&id=<?= $id ?>" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>Back to Trip</a>
+</div>
+
+<div class="card">
+<div class="card-body">
+    <!-- Existing docs -->
+    <div id="docList" class="mb-3">
+    <?php foreach ($trip_docs as $doc): ?>
+    <div class="d-flex align-items-center gap-2 mb-2 doc-item" id="doc-<?= $doc['id'] ?>">
+        <?php $ext = strtolower(pathinfo($doc['file_path'],PATHINFO_EXTENSION)); ?>
+        <i class="bi bi-file-earmark-<?= $ext==='pdf'?'pdf text-danger':'image text-primary' ?> fs-4"></i>
+        <div class="flex-grow-1">
+            <a href="<?= htmlspecialchars(r2_url($doc['file_path'])) ?>" target="_blank" class="fw-semibold text-decoration-none">
+                <?= htmlspecialchars($doc['doc_name']) ?>
+            </a>
+            <span class="badge bg-secondary ms-1"><?= htmlspecialchars($doc['doc_type']) ?></span>
+            <small class="text-muted ms-2"><?= date('d/m/Y H:i', strtotime($doc['uploaded_at'])) ?></small>
+        </div>
+        <a href="<?= htmlspecialchars(r2_url($doc['file_path'])) ?>" target="_blank" class="btn btn-action btn-outline-success" title="Download">
+            <i class="bi bi-download"></i>
+        </a>
+        <button type="button" class="btn btn-action btn-outline-danger" onclick="deleteDoc(<?= $doc['id'] ?>)" title="Delete">
+            <i class="bi bi-trash"></i>
+        </button>
+    </div>
+    <?php endforeach; ?>
+    <?php if (empty($trip_docs)): ?>
+    <p class="text-muted" id="noDocsMsg"><i class="bi bi-paperclip me-1"></i>No documents uploaded yet.</p>
+    <?php endif; ?>
+    </div>
+
+    <hr>
+    <!-- Upload -->
+    <h6 class="fw-bold mb-3"><i class="bi bi-upload me-2"></i>Upload New Document</h6>
+    <div class="row g-2 align-items-end">
+        <div class="col-6 col-md-3">
+            <label class="form-label form-label-sm">Document Type</label>
+            <select id="newDocType" class="form-select">
+                <option>Loading Slip</option>
+                <option>Weight Slip</option>
+                <option>Delivery Receipt</option>
+                <option>Permit Copy</option>
+                <option>E-Way Bill</option>
+                <option>Customer PO Copy</option>
+                <option>Invoice</option>
+                <option>Other</option>
+            </select>
+        </div>
+        <div class="col-6 col-md-3">
+            <label class="form-label form-label-sm">Document Name</label>
+            <input type="text" id="newDocName" class="form-control" placeholder="e.g. Loading Slip #123">
+        </div>
+        <div class="col-12 col-md-4">
+            <label class="form-label form-label-sm">File (PDF / JPG / PNG / WEBP)</label>
+            <input type="file" id="newDocFile" class="form-control" accept=".pdf,.jpg,.jpeg,.png,.webp">
+        </div>
+        <div class="col-6 col-md-2">
+            <button type="button" class="btn btn-primary w-100" onclick="uploadDoc()">
+                <i class="bi bi-upload me-1"></i>Upload
+            </button>
+        </div>
+    </div>
+    <div id="uploadMsg" class="mt-3" style="display:none"></div>
+</div>
+</div>
+
+<script>
+function uploadDoc() {
+    var file = document.getElementById('newDocFile').files[0];
+    if (!file) { alert('Please select a file.'); return; }
+    var type = document.getElementById('newDocType').value;
+    var name = document.getElementById('newDocName').value.trim() || file.name;
+    var msg  = document.getElementById('uploadMsg');
+    msg.style.display = 'block';
+    msg.innerHTML = '<div class="alert alert-secondary py-2"><i class="bi bi-hourglass-split me-1"></i>Uploading to cloud storage...</div>';
+    var fd = new FormData();
+    fd.append('trip_id', <?= $id ?>);
+    fd.append('doc_type', type);
+    fd.append('doc_name', name);
+    fd.append('doc_file', file);
+    fetch('fleet_trips.php?ajax=upload_doc', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(function(d) {
+            if (d.success) {
+                msg.innerHTML = '<div class="alert alert-success py-2"><i class="bi bi-check2 me-1"></i>Uploaded successfully.</div>';
+                var nd = document.getElementById('noDocsMsg');
+                if (nd) nd.remove();
+                var ext = d.r2_key ? d.r2_key.split('.').pop().toLowerCase() : '';
+                var icon = ext === 'pdf' ? 'bi-file-earmark-pdf text-danger' : 'bi-file-earmark-image text-primary';
+                var html = '<div class="d-flex align-items-center gap-2 mb-2 doc-item" id="doc-'+d.id+'">' +
+                    '<i class="bi '+icon+' fs-4"></i>' +
+                    '<div class="flex-grow-1"><a href="'+d.url+'" target="_blank" class="fw-semibold text-decoration-none">'+d.doc_name+'</a>' +
+                    '<span class="badge bg-secondary ms-1">'+d.doc_type+'</span></div>' +
+                    '<a href="'+d.url+'" target="_blank" class="btn btn-action btn-outline-success" title="Download"><i class="bi bi-download"></i></a>' +
+                    '<button type="button" class="btn btn-action btn-outline-danger" onclick="deleteDoc('+d.id+')" title="Delete"><i class="bi bi-trash"></i></button>' +
+                    '</div>';
+                document.getElementById('docList').insertAdjacentHTML('beforeend', html);
+                document.getElementById('newDocFile').value = '';
+                document.getElementById('newDocName').value = '';
+            } else {
+                msg.innerHTML = '<div class="alert alert-danger py-2"><i class="bi bi-x-circle me-1"></i>' + (d.error||'Upload failed.') + '</div>';
+            }
+        }).catch(function() {
+            msg.innerHTML = '<div class="alert alert-danger py-2">Network error. Please try again.</div>';
+        });
+}
+function deleteDoc(docId) {
+    if (!confirm('Delete this document?')) return;
+    var fd = new FormData();
+    fd.append('doc_id', docId);
+    fetch('fleet_trips.php?ajax=delete_doc', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(function(d) { if (d.success) { var el = document.getElementById('doc-'+docId); if (el) el.remove(); } });
+}
 </script>
 <?php endif; ?>
 <?php include '../includes/footer.php'; ?>

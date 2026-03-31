@@ -34,7 +34,7 @@ $modules_base = $in_modules ? '' : 'modules/';
     :root {
         --primary:       #1a5632;
         --secondary:     #27ae60;
-        --sidebar-w:     262px;
+        --sidebar-w:     220px;
         --topbar-h:      58px;
         --light-bg:      #f0f8f3;
         --transition:    0.28s cubic-bezier(.4,0,.2,1);
