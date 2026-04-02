@@ -450,6 +450,8 @@ $status_colors = ['Planned'=>'secondary','In Transit'=>'warning','Completed'=>'s
 
 /* ══════════════════════════════════ LIST ══════════════════════════════════ */
 if ($action === 'list'):
+$_uid = (int)($_SESSION['user_id'] ?? 0);
+$_user_filter = isAdmin() ? "" : " AND t.created_by=$_uid";
 $trips = $db->query("SELECT t.*, v.reg_no, d.full_name AS driver_name,
     p.po_number, vn.vendor_name, co.company_name
     FROM fleet_trips t
@@ -458,6 +460,7 @@ $trips = $db->query("SELECT t.*, v.reg_no, d.full_name AS driver_name,
     LEFT JOIN fleet_purchase_orders p ON t.po_id=p.id
     LEFT JOIN fleet_customers_master vn ON t.vendor_id=vn.id
     LEFT JOIN companies co ON t.company_id=co.id
+    WHERE 1=1 $_user_filter
     ORDER BY t.id DESC")->fetch_all(MYSQLI_ASSOC);
 $counts = [];
 foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;

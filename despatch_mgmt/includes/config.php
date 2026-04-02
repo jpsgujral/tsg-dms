@@ -273,6 +273,17 @@ function getDB() {
     return $conn;
 }
 
+/* ── R2 fallback — if r2_helper.php not loaded, define stubs so pages don't crash ── */
+if (!function_exists('r2_url')) {
+    function r2_url(string $key): string { return !empty($key) ? '../uploads/'.$key : ''; }
+}
+if (!function_exists('r2_delete')) {
+    function r2_delete(string $key): bool { return true; }
+}
+if (!function_exists('r2_handle_upload')) {
+    function r2_handle_upload(string $field, string $prefix, string $oldKey = ''): string { return ''; }
+}
+
 function sanitize($data) {
     $db = getDB();
     return $db->real_escape_string(trim(htmlspecialchars($data)));

@@ -28,6 +28,7 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_fuel_log (
     foreach ([
         'trip_id'        => "INT DEFAULT NULL AFTER driver_id",
         'fuel_bill_path' => "VARCHAR(255) DEFAULT NULL",
+        'created_by'     => "INT DEFAULT 0",
     ] as $col => $def) {
         $exists = $db->query("SELECT 1 FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA='$dbname' AND TABLE_NAME='fleet_fuel_log'
@@ -37,7 +38,7 @@ $db->query("CREATE TABLE IF NOT EXISTS fleet_fuel_log (
 })($db);
 
 $action = $_GET['action'] ?? 'list';
-$id     = (int)($_GET['id'] ?? 0);
+$id     = (int)($_POST['id'] ?? $_GET['id'] ?? 0);
 
 /* ── Delete ── */
 if (isset($_GET['delete']) && isAdmin()) {
@@ -95,11 +96,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_fuel'])) {
     } else {
         $doc_col = $bill_path_sql ? ',fuel_bill_path' : '';
         $doc_val = isset($fuel_bill_path) ? (",'".$db->real_escape_string($fuel_bill_path)."'") : '';
+        $uid_fuel = (int)($_SESSION['user_id'] ?? 0);
         $db->query("INSERT INTO fleet_fuel_log
             (fuel_company_id,vehicle_id,driver_id,trip_id,fuel_date,litres,rate_per_litre,
-             amount,odometer,payment_mode,bill_no,notes$doc_col)
+             amount,odometer,payment_mode,bill_no,notes$doc_col,created_by)
             VALUES ($fc_id,$veh_id,$drv_sql,$trip_sql,'$date',$litres,$rate,
-            $amount,$odo,'$mode','$bill','$notes'$doc_val)");
+            $amount,$odo,'$mode','$bill','$notes'$doc_val,$uid_fuel)");
         showAlert('success','Fuel entry added.');
     }
     // Return to trip view if came from there
@@ -124,10 +126,12 @@ if ($action === 'list'):
 $filter_veh  = (int)($_GET['vehicle'] ?? 0);
 $filter_trip = (int)($_GET['trip_id'] ?? 0);
 $filter_mo   = sanitize($_GET['month'] ?? date('Y-m'));
+$_uid_fuel = (int)($_SESSION['user_id'] ?? 0);
 
 $where = "WHERE fl.fuel_date LIKE '".substr($filter_mo,0,7)."%'";
 if ($filter_veh)  $where .= " AND fl.vehicle_id=$filter_veh";
 if ($filter_trip) $where .= " AND fl.trip_id=$filter_trip";
+if (!isAdmin())   $where .= " AND fl.created_by=$_uid_fuel";
 
 $entries = $db->query("SELECT fl.*, v.reg_no, v.make, v.model,
     d.full_name AS driver_name, fc.company_name AS fuel_company,
@@ -262,6 +266,7 @@ if ($prefill_trip) {
 </div>
 <form method="POST" enctype="multipart/form-data">
 <input type="hidden" name="save_fuel" value="1">
+<input type="hidden" name="id" value="<?= $id ?>">
 <input type="hidden" name="back" value="<?= $back ?: ($prefill_trip ?: '') ?>">
 <div class="row g-3">
 <div class="col-12"><div class="card"><div class="card-header"><i class="bi bi-droplet-fill me-2"></i>Fuel Details</div>

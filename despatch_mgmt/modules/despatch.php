@@ -5,6 +5,20 @@ $db = getDB();
 /* ── Page-level view permission check ── */
 requirePerm('despatch', 'view');
 
+/* ── AJAX: get POs for vendor ── */
+if (isset($_GET['ajax_get_pos'])) {
+    if (ob_get_level() > 0) ob_clean();
+    header('Content-Type: application/json');
+    $vid = (int)($_GET['vendor_id'] ?? 0);
+    $pos_ajax = [];
+    if ($vid) {
+        $res = $db->query("SELECT id, po_number FROM purchase_orders WHERE vendor_id=$vid AND status IN ('Approved','Partially Received') ORDER BY po_date DESC");
+        while ($row = $res->fetch_assoc()) $pos_ajax[] = $row;
+    }
+    echo json_encode($pos_ajax);
+    exit;
+}
+
 
 /* ── Safe ALTER: works on MySQL 5.6+ (no IF NOT EXISTS support) ── */
 function safeAddColumn($db, $table, $column, $definition) {
@@ -462,18 +476,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 $agent = $db->query("SELECT full_name, is_agent, slab1_upto, slab1_pct, slab2_pct
                     FROM app_users WHERE id=$agent_id AND is_agent=1")->fetch_assoc();
                 if ($agent) {
-                    // Use actual received weight from items (not $data['total_weight'] which may be stale)
-                    $weight = array_sum(array_column($valid_items, 'weight'));
-                    if ($weight <= 0) {
-                        // Fallback: fetch from DB if already saved
-                        $wt_row = $db->query("SELECT total_weight FROM despatch_orders WHERE id=$id")->fetch_assoc();
-                        $weight = (float)($wt_row['total_weight'] ?? 0);
-                    }
+                    $weight = (float)$data['total_weight'];
                     // Vendor rate = PO unit price for this despatch's PO
                     $vendor_rate = 0;
                     $po_id_comm  = (int)$data['po_id'];
                     $v_id        = (int)$data['vendor_id'];
                     if ($po_id_comm > 0) {
+                        // Get unit_price from PO items (first item's price as rate)
                         $po_rate_row = $db->query("SELECT unit_price FROM po_items
                             WHERE po_id=$po_id_comm LIMIT 1")->fetch_assoc();
                         $vendor_rate = (float)($po_rate_row['unit_price'] ?? 0);
@@ -494,12 +503,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $vendor_name   = $db->real_escape_string($data['consignee_name'] ?? '');
                     $challan_no    = $db->real_escape_string($data['challan_no'] ?? '');
                     if (empty($challan_no) && $id > 0) {
+                        // For existing records, fetch challan_no from DB
                         $cn_row = $db->query("SELECT challan_no, despatch_date FROM despatch_orders WHERE id=$id")->fetch_assoc();
                         $challan_no = $db->real_escape_string($cn_row['challan_no'] ?? '');
                         $data['despatch_date'] = $data['despatch_date'] ?: ($cn_row['despatch_date'] ?? '');
                     }
                     $desp_date     = $data['despatch_date'] ?? null;
                     $desp_date_sql = $desp_date ? "'".$db->real_escape_string($desp_date)."'" : 'NULL';
+                    // Upsert commission record
                     $db->query("INSERT INTO agent_commissions
                         (despatch_id, agent_id, challan_no, despatch_date, vendor_name,
                          received_weight, vendor_rate, transporter_rate, profit_per_mt,
@@ -515,15 +526,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             profit_per_mt=$profit_per_mt, slab_applied=$slab,
                             commission_pct=$pct, commission_amt=$comm_amt,
                             status=IF(status='Paid','Paid','Pending')");
-                }
-            } else {
-                $db->query("DELETE FROM agent_commissions WHERE despatch_id=$id AND status='Pending'");
-            }
-        } else {
-            $db->query("DELETE FROM agent_commissions WHERE despatch_id=$id AND status='Pending'");
-            $db->query("UPDATE despatch_orders SET total_weight=0, subtotal=0, gst_amount=0, total_amount=0 WHERE id=$id");
-            $db->query("UPDATE despatch_items SET weight=0, unit_price=0, gst_rate=0, gst_amount=0, total_price=0 WHERE despatch_id=$id");
-
                 }
             } else {
                 // Agent removed or not set — remove any pending commission for this despatch
@@ -669,7 +671,7 @@ include '../includes/header.php';
     <thead><tr><th>#</th><th>Challan No</th><th>Date</th><th>Consignee</th><th>Transporter</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead>
     <tbody>
     <?php
-    $list = $db->query("SELECT d.*,t.transporter_name,s.source_name,c.company_name AS co_name FROM despatch_orders d LEFT JOIN transporters t ON d.transporter_id=t.id LEFT JOIN source_of_material s ON d.source_of_material_id=s.id LEFT JOIN companies c ON d.company_id=c.id ORDER BY d.consignee_name ASC, d.despatch_date DESC, d.id DESC");
+    $list = $db->query("SELECT d.*,t.transporter_name,s.source_name,c.company_name AS co_name FROM despatch_orders d LEFT JOIN transporters t ON d.transporter_id=t.id LEFT JOIN source_of_material s ON d.source_of_material_id=s.id LEFT JOIN companies c ON d.company_id=c.id".(isAdmin() ? '' : " WHERE d.created_by=".(int)($_SESSION['user_id']??0))." ORDER BY d.consignee_name ASC, d.despatch_date DESC, d.id DESC");
     $rows = $list->fetch_all(MYSQLI_ASSOC);
 
     // Group by consignee_name
@@ -1148,7 +1150,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 </label>
                 <input type="date" name="mtc_test_date" id="mtc_test_date" class="form-control bg-light"
                        readonly tabindex="-1"
-                       value="<?= htmlspecialchars($despatch['mtc_test_date'] ?: ($despatch['despatch_date'] ?? date('Y-m-d'))) ?>">
+                       value="<?= htmlspecialchars(($despatch['mtc_test_date'] ?? '') ?: ($despatch['despatch_date'] ?? date('Y-m-d'))) ?>">
             </div>
         </div>
 
@@ -1501,25 +1503,30 @@ const vendorShipData = <?php
     echo json_encode($map);
 ?>;
 
-/* ── Filter PO dropdown by selected vendor ── */
+/* ── Filter PO dropdown by selected vendor — AJAX ── */
 function filterPOByVendor(vendorId) {
     vendorId = parseInt(vendorId, 10) || 0;
     var poSel = document.getElementById('poRefSelect');
     if (!poSel) return;
-    var current = parseInt(poSel.value, 10) || 0;
-    Array.from(poSel.options).forEach(function(opt) {
-        if (!opt.value) return; // keep "-- None --"
-        var optVendor = parseInt(opt.getAttribute('data-vendor'), 10) || 0;
-        opt.style.display = (!vendorId || optVendor === vendorId) ? '' : 'none';
-    });
-    // If current PO no longer belongs to selected vendor, reset it
-    if (current) {
-        var selOpt = poSel.querySelector('option[value="' + current + '"]');
-        if (selOpt && selOpt.style.display === 'none') {
-            poSel.value = '';
-            renderPOBalance(0);
-        }
-    }
+    poSel.innerHTML = '<option value="">-- Select PO --</option>';
+    renderPOBalance(0);
+    if (!vendorId) return;
+    fetch('despatch.php?ajax_get_pos=1&vendor_id=' + vendorId)
+        .then(function(r) { return r.json(); })
+        .then(function(pos) {
+            pos.forEach(function(p) {
+                var opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = p.po_number;
+                opt.setAttribute('data-vendor', vendorId);
+                poSel.appendChild(opt);
+            });
+            if (pos.length === 1) {
+                poSel.value = pos[0].id;
+                renderPOBalance(parseInt(pos[0].id));
+                populatePOItems(parseInt(pos[0].id));
+            }
+        });
 }
 
 /* ── Auto-populate item rows from PO ── */
@@ -1783,26 +1790,31 @@ function fillConsigneeFromVendor(sel) {
 }
 
 function applyConsigneeData(data) {
-    document.getElementById('consignee_name').value    = data.name    || '';
-    document.getElementById('consignee_address').value = data.address || '';
-    document.getElementById('consignee_city').value    = data.city    || '';
-    document.getElementById('consignee_state').value   = data.state   || '';
-    document.getElementById('consignee_pincode').value = data.pincode || '';
-    document.getElementById('consignee_gstin').value   = data.gstin   || '';
-    document.getElementById('consignee_contact').value = data.contact || '';
-
-    // Show success notice
-    document.getElementById('autofillVendorName').textContent = data.vendor_name;
-    document.getElementById('autofillNotice').style.display = 'block';
-    document.getElementById('autofillBadge').classList.remove('d-none');
-
-    // Highlight filled fields briefly
+    var f = {
+        'consignee_name':    data.name    || '',
+        'consignee_address': data.address || '',
+        'consignee_city':    data.city    || '',
+        'consignee_state':   data.state   || '',
+        'consignee_pincode': data.pincode || '',
+        'consignee_gstin':   data.gstin   || '',
+        'consignee_contact': data.contact || ''
+    };
+    Object.keys(f).forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.value = f[id];
+    });
+    var vn = document.getElementById('autofillVendorName');
+    if (vn) vn.textContent = data.vendor_name;
+    var an = document.getElementById('autofillNotice');
+    if (an) an.style.display = 'block';
+    var ab = document.getElementById('autofillBadge');
+    if (ab) ab.classList.remove('d-none');
     ['consignee_name','consignee_address','consignee_city',
-     'consignee_state','consignee_pincode','consignee_gstin','consignee_contact'].forEach(fid => {
-        const el = document.getElementById(fid);
+     'consignee_state','consignee_pincode','consignee_gstin','consignee_contact'].forEach(function(fid) {
+        var el = document.getElementById(fid);
         if (el && el.value) {
             el.classList.add('border-success');
-            setTimeout(() => el.classList.remove('border-success'), 2500);
+            setTimeout(function() { el.classList.remove('border-success'); }, 2500);
         }
     });
 }
@@ -1892,21 +1904,6 @@ function bindMTCSyncListeners() {
 /* ── Show/hide delivery docs section based on status ── */
 function onStatusChange(sel) {
     var delivered = sel.value === 'Delivered';
-
-    // ── Issue 1 fix: warn if trying to set Delivered with no received weight ──
-    if (delivered) {
-        var weights = document.querySelectorAll('#dItemsBody [name="weight[]"]');
-        var totalWt = 0;
-        weights.forEach(function(w) { totalWt += parseFloat(w.value) || 0; });
-        if (totalWt <= 0) {
-            alert('⚠️ Cannot set status to Delivered — Received Weight is 0.\n\nPlease enter Received Weight for all items first.');
-            sel.value = sel.dataset.prev || 'In Transit';
-            return;
-        }
-    }
-    // Remember previous value for reverting
-    sel.dataset.prev = sel.value;
-
     var sec = document.getElementById('deliveryDocsSection');
     if (sec) sec.style.display = delivered ? 'block' : 'none';
     var fiSec = document.getElementById('freightInvoiceSection');
@@ -1998,7 +1995,6 @@ document.addEventListener('DOMContentLoaded', function() {
     var statusSel = document.querySelector('[name="status"]');
     if (statusSel) {
         statusSel.addEventListener('change', function() { onStatusChange(this); });
-        statusSel.dataset.prev = statusSel.value; // store initial value
         onStatusChange(statusSel); // run on load
     }
     toggleHardCopy();

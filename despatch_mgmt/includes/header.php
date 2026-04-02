@@ -507,6 +507,7 @@ function closeSidebar() {
         'company_settings.php'     => 'settings',
         'users.php'                => 'settings',
         'error_log.php'               => 'settings',
+        'data_cleanup.php'            => 'settings',
     ];
     // backup/index.php maps to settings section
     if ($in_backup && $current_page === 'index.php') {
@@ -718,6 +719,9 @@ function closeSidebar() {
         }
         ?>
         </span>
+    </a>
+    <a href="<?= $modules_base ?>data_cleanup.php" class="nav-link <?= $current_page=='data_cleanup.php'?'active':'' ?>">
+        <i class="bi bi-trash3"></i><span>Data Cleanup</span>
     </a>
     <?php navSectionEnd(); ?>
     <?php endif; ?>

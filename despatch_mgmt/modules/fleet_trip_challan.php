@@ -29,21 +29,15 @@ if (!$t) die('Trip not found.');
 $trip_items = $db->query("SELECT * FROM fleet_trip_items WHERE trip_id=$id ORDER BY id")->fetch_all(MYSQLI_ASSOC);
 $company    = getCompany();
 
-/* ── Fetch supervisor signature from app_users ── */
-$auth_sig_path = '';
-if (!empty($t['supervisor_id'])) {
-    // Try to find app_user linked to supervisor by matching name
-    $sup_user = $db->query("SELECT signature_path FROM app_users
-        WHERE status='Active' AND signature_path IS NOT NULL AND signature_path != ''
-        ORDER BY id LIMIT 1")->fetch_assoc();
-    if ($sup_user) $auth_sig_path = $sup_user['signature_path'];
-}
-// Fallback — any active user with a signature
-if (!$auth_sig_path) {
-    $any_sig = $db->query("SELECT signature_path FROM app_users
-        WHERE status='Active' AND signature_path IS NOT NULL AND signature_path != ''
-        ORDER BY id LIMIT 1")->fetch_assoc();
-    if ($any_sig) $auth_sig_path = $any_sig['signature_path'];
+/* ── Logged-in user for Supervisor / Authorised By ── */
+$logged_user_name = '';
+$uid_challan = (int)($_SESSION['user_id'] ?? 0);
+if ($uid_challan) {
+    $lu = $db->query("SELECT full_name, signature_path FROM app_users WHERE id=$uid_challan LIMIT 1")->fetch_assoc();
+    if ($lu) {
+        $logged_user_name = $lu['full_name'] ?? '';
+        $auth_sig_path    = $lu['signature_path'] ?? '';
+    }
 }
 
 /* ── Image helper ── */
@@ -480,13 +474,9 @@ function printPDF() {
              style="max-height:45px;max-width:120px;object-fit:contain;display:block;margin:0 auto 4px">
         <?php endif; ?>
         <div class="sig-title">Supervisor / Authorised By</div>
-        <?php if ($t['supervisor_name']): ?><small><?= esc($t['supervisor_name']) ?></small><?php endif; ?>
+        <?php if ($logged_user_name): ?><small><?= esc($logged_user_name) ?></small><?php endif; ?>
     </div>
     <div class="sign-box">
-        <?php if (!empty($company['seal_path'])): ?>
-        <img src="<?= fleetImgUrl($company['seal_path']) ?>" alt="Company Seal"
-             style="max-height:55px;max-width:80px;object-fit:contain;display:block;margin:0 auto 4px;opacity:.85">
-        <?php endif; ?>
         <div class="sig-title">Consignee Signature</div>
         <small>(Goods Received in Good Condition)</small>
     </div>

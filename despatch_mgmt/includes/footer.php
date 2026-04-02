@@ -75,3 +75,4 @@ function confirmDelete(id, url) {
 </script>
 </body>
 </html>
+<?php ob_end_flush(); ?>

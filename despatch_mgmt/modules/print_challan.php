@@ -51,6 +51,18 @@ $items = $db->query("
 
 $company = getCompany((int)($despatch['company_id'] ?? 0));
 
+/* ── Logged-in user for Checked By ── */
+$logged_user_name_ch = '';
+$logged_user_sig_ch  = '';
+$uid_ch = (int)($_SESSION['user_id'] ?? 0);
+if ($uid_ch) {
+    $lu_ch = $db->query("SELECT full_name, signature_path FROM app_users WHERE id=$uid_ch LIMIT 1")->fetch_assoc();
+    if ($lu_ch) {
+        $logged_user_name_ch = $lu_ch['full_name'] ?? '';
+        $logged_user_sig_ch  = $lu_ch['signature_path'] ?? '';
+    }
+}
+
 /* ── Clean address text: strip ALL backslashes, literal \n, normalize whitespace ── */
 function cleanAddress($str) {
     if (empty($str)) return '';
@@ -606,7 +618,7 @@ foreach ($copies as $idx => $copyLabel):
         </div>
         <div class="sig-box">
             <?php
-            $cb_img = $company['mtc_sig_path'] ?? '';
+            $cb_img = $logged_user_sig_ch ?: ($company['mtc_sig_path'] ?? '');
             if ($cb_img): ?>
             <div style="text-align:center;padding:3px 0">
                 <img src="<?= img_display_url($cb_img) ?>" alt="Checked By"
@@ -614,6 +626,9 @@ foreach ($copies as $idx => $copyLabel):
             </div>
             <?php endif; ?>
             <div class="sig-title">Checked By</div>
+            <?php if ($logged_user_name_ch): ?>
+            <div style="font-size:7.5pt;font-weight:600;color:#1a5632;margin-top:2px"><?= esc($logged_user_name_ch) ?></div>
+            <?php endif; ?>
         </div>
         <div class="sig-box">
             <div class="sig-title">Driver's Signature<br>(Goods Received in Good Condition)</div>

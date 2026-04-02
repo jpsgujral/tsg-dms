@@ -85,7 +85,7 @@ function generateFleetPONo($db) {
 }
 
 $action = $_GET['action'] ?? 'list';
-$id     = (int)($_GET['id'] ?? 0);
+$id     = (int)($_POST['id'] ?? $_GET['id'] ?? 0);
 
 /* ── Delete ── */
 if (isset($_GET['delete']) && isAdmin()) {
@@ -238,6 +238,7 @@ $pos = $db->query("SELECT p.*, v.vendor_name, co.company_name,
     FROM fleet_purchase_orders p
     LEFT JOIN fleet_customers_master v ON p.vendor_id=v.id
     LEFT JOIN companies co ON p.company_id=co.id
+    WHERE 1=1".(isAdmin() ? '' : " AND p.created_by=".(int)(\$_SESSION['user_id']??0))."
     ORDER BY co.company_name ASC, p.po_date DESC, p.id DESC")->fetch_all(MYSQLI_ASSOC);
 
 $grouped = [];
@@ -471,6 +472,7 @@ foreach ($vendors_raw as $v) {
 </div>
 <form method="POST" enctype="multipart/form-data">
 <input type="hidden" name="save_po" value="1">
+<input type="hidden" name="id" value="<?= $id ?>">
 <div class="row g-3">
 
 <!-- PO Details -->
