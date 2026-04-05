@@ -1,8 +1,6 @@
 <?php
-ob_start();
 require_once '../includes/config.php';
 require_once '../includes/auth.php';
-if (file_exists('../includes/r2_helper.php')) require_once '../includes/r2_helper.php';
 $db = getDB();
 
 /* ── AJAX: Add new source of material ── */
@@ -194,11 +192,20 @@ function generateTripNo($db) {
     $month    = (int)date('m'); $year = (int)date('Y');
     $fy_start = $month >= 4 ? $year : $year - 1;
     $fy_label = ($fy_start % 100) . '-' . str_pad(($fy_start+1) % 100, 2, '0', STR_PAD_LEFT);
+    $fy_key   = 'trip_fy' . ($fy_start % 100) . str_pad(($fy_start+1) % 100, 2, '0', STR_PAD_LEFT);
     $prefix   = "TR/$fy_label/";
-    $db->query("LOCK TABLES fleet_trips WRITE");
-    $row  = $db->query("SELECT trip_no FROM fleet_trips WHERE trip_no LIKE '$prefix%' ORDER BY id DESC LIMIT 1")->fetch_assoc();
-    $next = $row ? (int)substr($row['trip_no'], strrpos($row['trip_no'], '/') + 1) + 1 : 1;
-    $trip_no = $prefix . str_pad($next, 4, '0', STR_PAD_LEFT);
+
+    $db->query("LOCK TABLES fleet_trips WRITE, doc_sequences WRITE");
+
+    // Check sequence table seed first
+    $seq = $db->query("SELECT last_val FROM doc_sequences WHERE seq_key='$fy_key' LIMIT 1")->fetch_assoc();
+    $row = $db->query("SELECT trip_no FROM fleet_trips WHERE trip_no LIKE '$prefix%' ORDER BY id DESC LIMIT 1")->fetch_assoc();
+
+    $from_seq = $seq ? (int)$seq['last_val'] : 0;
+    $from_db  = $row ? (int)substr($row['trip_no'], strrpos($row['trip_no'], '/') + 1) : 0;
+    $next     = max($from_seq, $from_db) + 1;
+
+    $trip_no = $prefix . $next; // no zero-padding for large numbers
     $db->query("UNLOCK TABLES");
     return $trip_no;
 }
@@ -242,11 +249,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_trip'])) {
     requirePerm('fleet_trips', $id > 0 ? 'update' : 'create');
 
     $trip_no   = $id > 0 ? sanitize($_POST['trip_no']) : generateTripNo($db);
-    $trip_date = sanitize($_POST['trip_date']);
+    $trip_date = sanitize($_POST['trip_date'] ?? '');
     $po_id     = (int)($_POST['po_id']    ?? 0);
     $vendor_id = (int)($_POST['vendor_id'] ?? 0);
-    $veh_id    = (int)$_POST['vehicle_id'];
-    $drv_id    = (int)$_POST['driver_id'];
+    $veh_id    = (int)($_POST['vehicle_id'] ?? 0);
+    $drv_id    = (int)($_POST['driver_id']  ?? 0);
     $sup_id    = (int)($_POST['supervisor_id'] ?? 0);
     $from      = sanitize($_POST['from_location']    ?? '');
     $to        = sanitize($_POST['to_location']      ?? '');
@@ -451,7 +458,7 @@ $status_colors = ['Planned'=>'secondary','In Transit'=>'warning','Completed'=>'s
 /* ══════════════════════════════════ LIST ══════════════════════════════════ */
 if ($action === 'list'):
 $_uid = (int)($_SESSION['user_id'] ?? 0);
-$_user_filter = isAdmin() ? "" : " AND t.created_by=$_uid";
+$_user_filter = canViewAll('trips') ? "" : " AND t.created_by=$_uid";
 $trips = $db->query("SELECT t.*, v.reg_no, d.full_name AS driver_name,
     p.po_number, vn.vendor_name, co.company_name
     FROM fleet_trips t
@@ -463,7 +470,15 @@ $trips = $db->query("SELECT t.*, v.reg_no, d.full_name AS driver_name,
     WHERE 1=1 $_user_filter
     ORDER BY t.id DESC")->fetch_all(MYSQLI_ASSOC);
 $counts = [];
+$counts = [];
 foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;
+
+// Group by company
+$grouped = [];
+foreach ($trips as $t) {
+    $co = $t['company_name'] ?? 'General';
+    $grouped[$co][] = $t;
+}
 ?>
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
     <h5 class="mb-0 fw-bold">Trip Orders</h5>
@@ -471,6 +486,8 @@ foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;
     <a href="?action=add" class="btn btn-primary"><i class="bi bi-plus-circle me-1"></i>New Trip</a>
     <?php endif; ?>
 </div>
+
+<!-- Status filter bar -->
 <div class="card mb-3">
 <div class="card-body py-2 d-flex gap-1 flex-wrap">
     <button class="btn btn-sm btn-dark trip-filter active" data-status="All" onclick="tripFilter('All',this)">All <span class="badge bg-secondary ms-1"><?= count($trips) ?></span></button>
@@ -481,57 +498,95 @@ foreach ($trips as $t) $counts[$t['status']] = ($counts[$t['status']] ?? 0) + 1;
     <?php endforeach; ?>
 </div>
 </div>
-<div class="card"><div class="card-body p-0">
-<div class="table-responsive">
-<table class="table table-hover mb-0 datatable" id="tripsTable">
-<thead><tr>
-    <th>Trip No</th><th>Date</th><?php if(count($all_companies)>1): ?><th>Company</th><?php endif; ?>
-    <th>Customer PO</th><th>Customer</th><th>Vehicle</th><th>Driver</th>
-    <th class="text-end">Weight</th>
-    <th class="text-end">Freight</th><th>Status</th><th>Actions</th>
-</tr></thead>
-<tbody>
-<?php foreach ($trips as $t):
-    $sc = $status_colors[$t['status']] ?? 'secondary';
+
+<!-- Grouped by Company -->
+<?php $gi = 0; foreach ($grouped as $co_name => $co_trips): $gi++;
+    $grp_id = 'cogrp_'.$gi;
+    $co_wt  = array_sum(array_column($co_trips, 'total_weight'));
+    $co_fr  = array_sum(array_column($co_trips, 'freight_amount'));
 ?>
-<tr data-status="<?= $t['status'] ?>">
-    <td><strong><?= htmlspecialchars($t['trip_no']) ?></strong></td>
-    <td><?= date('d/m/Y', strtotime($t['trip_date'])) ?></td>
-    <?php if(count($all_companies)>1): ?><td><span class='badge bg-primary' style='font-size:.7rem'><?= htmlspecialchars($t['company_name']??'-') ?></span></td><?php endif; ?>
-    <td><?= $t['po_number'] ? '<span class="badge bg-info text-dark">'.htmlspecialchars($t['po_number']).'</span>' : '—' ?></td>
-    <td><?= htmlspecialchars($t['vendor_name'] ?? $t['customer_name'] ?? '—') ?><br><small class="text-muted"><?= htmlspecialchars($t['customer_city']??'') ?></small></td>
-    <td><span class="badge bg-dark"><?= htmlspecialchars($t['reg_no']) ?></span></td>
-    <td><?= htmlspecialchars($t['driver_name']) ?></td>
-    <td class="text-end"><?= number_format($t['total_weight'],3) ?> MT</td>
-    <td class="text-end">₹<?= number_format($t['freight_amount'],2) ?></td>
-    <td><span class="badge bg-<?= $sc ?>"><?= $t['status'] ?></span></td>
-    <td>
-        <a href="?action=view&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-info me-1" title="View"><i class="bi bi-eye"></i></a>
-        <?php if (canDo('fleet_trips','update') && !in_array($t['status'],['Completed','Cancelled'])): ?>
-        <a href="?action=edit&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-primary me-1" title="Edit"><i class="bi bi-pencil"></i></a>
-        <?php endif; ?>
-        <?php if ($t['status'] === 'Completed'): ?>
-        <a href="?action=docs&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-primary me-1" title="Manage Documents"><i class="bi bi-paperclip"></i></a>
-        <?php endif; ?>
-        <a href="fleet_trip_challan.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-action btn-outline-success me-1" title="Print"><i class="bi bi-printer"></i></a>
-        <a href="export_trip_pdf.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-action btn-outline-danger me-1" title="PDF"><i class="bi bi-file-earmark-pdf"></i></a>
-        <?php if (isAdmin() && $t['status'] === 'Planned'): ?>
-        <a href="?delete=<?= $t['id'] ?>" onclick="return confirm('Delete this trip?')" class="btn btn-action btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></a>
-        <?php endif; ?>
-    </td>
-</tr>
+<div class="card mb-3 company-group" id="<?= $grp_id ?>">
+    <div class="card-header d-flex align-items-center gap-2 py-2"
+         style="cursor:pointer;background:#e8f4e8;border-left:4px solid #1a5632"
+         onclick="toggleCoGroup('<?= $grp_id ?>')">
+        <i class="bi bi-chevron-down" id="chev_<?= $grp_id ?>"></i>
+        <i class="bi bi-building me-1 text-success"></i>
+        <strong><?= htmlspecialchars($co_name) ?></strong>
+        <span class="badge bg-secondary ms-1"><?= count($co_trips) ?> Trip<?= count($co_trips)>1?'s':''?></span>
+        <span class="text-muted ms-2" style="font-size:.82rem">
+            <?= number_format($co_wt,2) ?> MT &nbsp;|&nbsp; ₹<?= number_format($co_fr,2) ?>
+        </span>
+    </div>
+    <div class="card-body p-0" id="body_<?= $grp_id ?>">
+    <div class="table-responsive">
+    <table class="table table-hover mb-0" style="font-size:.88rem">
+    <thead class="table-light"><tr>
+        <th>Trip No</th><th>Date</th>
+        <th>Customer PO</th><th>Customer</th><th>Vehicle</th><th>Driver</th>
+        <th class="text-end">Weight</th><th class="text-end">Freight</th>
+        <th>Status</th><th>Actions</th>
+    </tr></thead>
+    <tbody>
+    <?php foreach ($co_trips as $t):
+        $sc = $status_colors[$t['status']] ?? 'secondary';
+    ?>
+    <tr data-status="<?= $t['status'] ?>" class="trip-row">
+        <td><strong><?= htmlspecialchars($t['trip_no']) ?></strong></td>
+        <td><?= date('d/m/Y', strtotime($t['trip_date'])) ?></td>
+        <td><?= $t['po_number'] ? '<span class="badge bg-info text-dark">'.htmlspecialchars($t['po_number']).'</span>' : '—' ?></td>
+        <td><?= htmlspecialchars($t['vendor_name'] ?? $t['customer_name'] ?? '—') ?><br><small class="text-muted"><?= htmlspecialchars($t['customer_city']??'')?></small></td>
+        <td><span class="badge bg-dark"><?= htmlspecialchars($t['reg_no']) ?></span></td>
+        <td><?= htmlspecialchars($t['driver_name']) ?></td>
+        <td class="text-end"><?= number_format($t['total_weight'],3) ?> MT</td>
+        <td class="text-end">₹<?= number_format($t['freight_amount'],2) ?></td>
+        <td><span class="badge bg-<?= $sc ?>"><?= $t['status'] ?></span></td>
+        <td>
+            <a href="?action=view&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-info me-1" title="View"><i class="bi bi-eye"></i></a>
+            <?php if (canDo('fleet_trips','update') && !in_array($t['status'],['Completed','Cancelled'])): ?>
+            <a href="?action=edit&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-primary me-1" title="Edit"><i class="bi bi-pencil"></i></a>
+            <?php endif; ?>
+            <?php if ($t['status'] === 'Completed'): ?>
+            <a href="?action=docs&id=<?= $t['id'] ?>" class="btn btn-action btn-outline-primary me-1" title="Documents"><i class="bi bi-paperclip"></i></a>
+            <?php endif; ?>
+            <a href="fleet_trip_challan.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-action btn-outline-success me-1" title="Print"><i class="bi bi-printer"></i></a>
+            <a href="export_trip_pdf.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-action btn-outline-danger me-1" title="PDF"><i class="bi bi-file-earmark-pdf"></i></a>
+            <?php if (isAdmin() && $t['status'] === 'Planned'): ?>
+            <a href="?delete=<?= $t['id'] ?>" onclick="return confirm('Delete this trip?')" class="btn btn-action btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></a>
+            <?php endif; ?>
+        </td>
+    </tr>
+    <?php endforeach; ?>
+    </tbody>
+    </table>
+    </div>
+    </div>
+</div>
 <?php endforeach; ?>
-</tbody>
-</table>
-</div></div></div>
+
 <style>.trip-filter.active{box-shadow:0 0 0 2px rgba(30,58,95,.5)}</style>
 <script>
 function tripFilter(status, btn) {
     document.querySelectorAll('.trip-filter').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    document.querySelectorAll('#tripsTable tbody tr').forEach(r => {
+    document.querySelectorAll('.trip-row').forEach(r => {
         r.style.display = (status === 'All' || r.dataset.status === status) ? '' : 'none';
     });
+    // Hide empty company groups
+    document.querySelectorAll('.company-group').forEach(function(grp) {
+        var visible = Array.from(grp.querySelectorAll('.trip-row')).some(r => r.style.display !== 'none');
+        grp.style.display = visible ? '' : 'none';
+    });
+}
+function toggleCoGroup(id) {
+    var body = document.getElementById('body_' + id);
+    var chev = document.getElementById('chev_' + id);
+    if (body.style.display === 'none') {
+        body.style.display = '';
+        chev.className = 'bi bi-chevron-down';
+    } else {
+        body.style.display = 'none';
+        chev.className = 'bi bi-chevron-right';
+    }
 }
 </script>
 
@@ -942,10 +997,13 @@ $is_completed = ($t['status'] ?? '') === 'Completed';
         $month = (int)date('m'); $year = (int)date('Y');
         $fy_start = $month >= 4 ? $year : $year - 1;
         $fy_label = ($fy_start % 100) . '-' . str_pad(($fy_start+1) % 100, 2, '0', STR_PAD_LEFT);
+        $fy_key   = 'trip_fy' . ($fy_start % 100) . str_pad(($fy_start+1) % 100, 2, '0', STR_PAD_LEFT);
         $prefix   = "TR/$fy_label/";
+        $seq_row  = $db->query("SELECT last_val FROM doc_sequences WHERE seq_key='$fy_key' LIMIT 1")->fetch_assoc();
         $last_tr  = $db->query("SELECT trip_no FROM fleet_trips WHERE trip_no LIKE '$prefix%' ORDER BY id DESC LIMIT 1")->fetch_assoc();
-        $next_num = $last_tr ? (int)substr($last_tr['trip_no'], strrpos($last_tr['trip_no'], '/') + 1) + 1 : 1;
-        $preview_trip_no = $prefix . str_pad($next_num, 4, '0', STR_PAD_LEFT);
+        $from_seq = $seq_row ? (int)$seq_row['last_val'] : 0;
+        $from_db  = $last_tr ? (int)substr($last_tr['trip_no'], strrpos($last_tr['trip_no'], '/') + 1) : 0;
+        $preview_trip_no = $prefix . (max($from_seq, $from_db) + 1);
     ?>
     <div class="col-6 col-md-2">
         <label class="form-label">Trip No</label>

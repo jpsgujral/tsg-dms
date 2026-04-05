@@ -55,6 +55,7 @@ include '../includes/header.php';
     <tbody>
     <?php
     $where = "1=1";
+    if (!canViewAll('challans')) $where .= " AND d.created_by=".(int)($_SESSION['user_id']??0);
     if (!empty($_GET['from_date'])) $where .= " AND d.despatch_date >= '" . sanitize($_GET['from_date']) . "'";
     if (!empty($_GET['to_date'])) $where .= " AND d.despatch_date <= '" . sanitize($_GET['to_date']) . "'";
     if (!empty($_GET['status'])) $where .= " AND d.status = '" . sanitize($_GET['status']) . "'";

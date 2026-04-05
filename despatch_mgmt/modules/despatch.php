@@ -72,8 +72,17 @@ function peekChallanNo($db) {
     $fy  = currentFY();
     $key = "challan_fy{$fy}";
     _fySeqEnsure($db, $key);
-    $cur = (int)$db->query("SELECT last_val FROM doc_sequences WHERE seq_key='$key'")->fetch_assoc()['last_val'];
-    return "DC/{$fy}/" . str_pad($cur + 1, 4, '0', STR_PAD_LEFT);
+    $seq_val = (int)$db->query("SELECT last_val FROM doc_sequences WHERE seq_key='$key'")->fetch_assoc()['last_val'];
+    // Also check actual max in despatch_orders to handle any drift
+    $prefix  = "DC/{$fy}/";
+    $max_row = $db->query("SELECT MAX(CAST(SUBSTRING_INDEX(challan_no,'/',-1) AS UNSIGNED)) AS mx FROM despatch_orders WHERE challan_no LIKE '$prefix%'")->fetch_assoc();
+    $db_max  = (int)($max_row['mx'] ?? 0);
+    $next    = max($seq_val, $db_max) + 1;
+    // Sync sequence if drifted
+    if ($db_max > $seq_val) {
+        $db->query("UPDATE doc_sequences SET last_val=$db_max WHERE seq_key='$key'");
+    }
+    return "DC/{$fy}/" . str_pad($next, 4, '0', STR_PAD_LEFT);
 }
 
 /* Generate — atomic increment, returns BOTH challan_no and despatch_no in one call.
@@ -82,7 +91,15 @@ function generateChallanAndDespatchNo($db) {
     $fy  = currentFY();
     $key = "challan_fy{$fy}";
     _fySeqEnsure($db, $key);
-    // Atomic increment — single UPDATE, then read
+    // Sync sequence with actual max in DB first (prevents duplicates on drift)
+    $prefix  = "DC/{$fy}/";
+    $max_row = $db->query("SELECT MAX(CAST(SUBSTRING_INDEX(challan_no,'/',-1) AS UNSIGNED)) AS mx FROM despatch_orders WHERE challan_no LIKE '$prefix%'")->fetch_assoc();
+    $db_max  = (int)($max_row['mx'] ?? 0);
+    $seq_val = (int)$db->query("SELECT last_val FROM doc_sequences WHERE seq_key='$key'")->fetch_assoc()['last_val'];
+    if ($db_max > $seq_val) {
+        $db->query("UPDATE doc_sequences SET last_val=$db_max WHERE seq_key='$key'");
+    }
+    // Atomic increment
     $db->query("UPDATE doc_sequences SET last_val = last_val + 1 WHERE seq_key='$key'");
     $next = (int)$db->query("SELECT last_val FROM doc_sequences WHERE seq_key='$key'")->fetch_assoc()['last_val'];
     $num  = str_pad($next, 4, '0', STR_PAD_LEFT);
@@ -294,7 +311,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $data['freight_amount']        = (float)($_POST['freight_amount']        ?? 0);
     $data['vendor_freight_amount'] = (float)($_POST['vendor_freight_amount'] ?? 0);
     $data['company_id']   = (int)($_POST['company_id'] ?? activeCompanyId());
-    $data['agent_id']     = (int)($_POST['agent_id'] ?? 0) ?: 'NULL';
+    $data['agent_id'] = (int)($_POST['agent_id'] ?? 0) ?: null;
 
     // Items
     $item_ids = $_POST['item_id'] ?? [];
@@ -329,7 +346,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $grand_total = $subtotal + $gst_total;
 
     $errors = [];
-    if (empty($data['consignee_name']))       $errors[] = 'Consignee Name is required.';
+    // Always auto-fill consignee from vendor (consignee card is hidden)
+    if ($data['vendor_id'] > 0) {
+        $vrow = $db->query("SELECT vendor_name, ship_name, ship_address, ship_city, ship_state, ship_pincode, ship_gstin FROM vendors WHERE id=".(int)$data['vendor_id']." LIMIT 1")->fetch_assoc();
+        if ($vrow) {
+            $data['consignee_name']    = $vrow['ship_name'] ?: $vrow['vendor_name'];
+            if (empty($data['consignee_address'])) $data['consignee_address'] = $vrow['ship_address'] ?? '';
+            if (empty($data['consignee_city']))    $data['consignee_city']    = $vrow['ship_city']    ?? '';
+            if (empty($data['consignee_state']))   $data['consignee_state']   = $vrow['ship_state']   ?? '';
+            if (empty($data['consignee_pincode'])) $data['consignee_pincode'] = $vrow['ship_pincode'] ?? '';
+            if (empty($data['consignee_gstin']))   $data['consignee_gstin']   = $vrow['ship_gstin']   ?? '';
+        }
+    }
+    if (empty($data['consignee_name'])) $errors[] = 'Consignee Name is required. Please select a Vendor.';
     if ($data['source_of_material_id'] < 1)   $errors[] = 'Source of Material is required.';
     if ($data['po_id'] < 1)                                      $errors[] = 'PO Reference is required.';
     if ($data['transporter_id'] < 1)                             $errors[] = 'Transporter is required.';
@@ -372,10 +401,26 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $db->query("UPDATE despatch_orders SET " . implode(',', $set) . " WHERE id=$id");
             $db->query("DELETE FROM despatch_items WHERE despatch_id=$id");
         } else {
-            // INSERT — generate BOTH numbers in ONE atomic increment
+            // INSERT
+            $manual_ch = trim($_POST['manual_challan_no'] ?? '');
+            // Generate auto number first
             $nums = generateChallanAndDespatchNo($db);
             $new_challan_no  = $nums['challan_no'];
             $new_despatch_no = $nums['despatch_no'];
+            // Override with manual if different from auto-generated
+            if ($manual_ch && $manual_ch !== $new_challan_no) {
+                $dup = $db->query("SELECT id FROM despatch_orders WHERE challan_no='".$db->real_escape_string($manual_ch)."' LIMIT 1")->num_rows;
+                if ($dup) {
+                    showAlert('danger', "Challan No '$manual_ch' already exists.");
+                    redirect('despatch.php?action=add');
+                }
+                $new_challan_no  = $manual_ch;
+                $new_despatch_no = str_replace('DC/', 'DSP/', $manual_ch);
+                // Roll back the sequence increment since we used manual number
+                $fy  = substr($manual_ch, 3, 4);
+                $key = "challan_fy{$fy}";
+                $db->query("UPDATE doc_sequences SET last_val = last_val - 1 WHERE seq_key='$key'");
+            }
             $data['lr_number'] = $new_challan_no; // Challan No cum LR No
 
             $cols = 'despatch_no,challan_no,created_by,' . implode(',', array_keys($data)) . ',subtotal,gst_amount,total_amount';
@@ -391,8 +436,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $vals[] = $subtotal;
             $vals[] = $gst_total;
             $vals[] = $grand_total;
-            $db->query("INSERT INTO despatch_orders ($cols) VALUES (" . implode(',', $vals) . ")");
+            $result = $db->query("INSERT INTO despatch_orders ($cols) VALUES (" . implode(',', $vals) . ")");
             $id = $db->insert_id;
+            if (!$result || !$id) {
+                showAlert('danger', 'Failed to save Despatch Order. DB Error: ' . $db->error . ' Please try again.');
+                goto skip_redirect;
+            }
         }
         // Link despatch to the latest active rate card for this transporter+vendor pair
         $rc_tid = (int)$data['transporter_id'];
@@ -540,6 +589,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         }
 
         showAlert('success', 'Despatch Order saved successfully.');
+        skip_redirect:
         redirect('despatch.php');
     }
 }
@@ -671,7 +721,7 @@ include '../includes/header.php';
     <thead><tr><th>#</th><th>Challan No</th><th>Date</th><th>Consignee</th><th>Transporter</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead>
     <tbody>
     <?php
-    $list = $db->query("SELECT d.*,t.transporter_name,s.source_name,c.company_name AS co_name FROM despatch_orders d LEFT JOIN transporters t ON d.transporter_id=t.id LEFT JOIN source_of_material s ON d.source_of_material_id=s.id LEFT JOIN companies c ON d.company_id=c.id".(isAdmin() ? '' : " WHERE d.created_by=".(int)($_SESSION['user_id']??0))." ORDER BY d.consignee_name ASC, d.despatch_date DESC, d.id DESC");
+    $list = $db->query("SELECT d.*,t.transporter_name,s.source_name,c.company_name AS co_name FROM despatch_orders d LEFT JOIN transporters t ON d.transporter_id=t.id LEFT JOIN source_of_material s ON d.source_of_material_id=s.id LEFT JOIN companies c ON d.company_id=c.id".(canViewAll('despatch') ? '' : " WHERE (d.created_by=".(int)($_SESSION['user_id']??0)." OR d.created_by=0 OR d.created_by IS NULL)")." ORDER BY d.consignee_name ASC, d.despatch_date DESC, d.id DESC");
     $rows = $list->fetch_all(MYSQLI_ASSOC);
 
     // Group by consignee_name
@@ -809,12 +859,10 @@ document.addEventListener('DOMContentLoaded', function(){
         <?php endif; ?>
         <div class="col-8 col-sm-5 col-md-3">
             <label class="form-label">Challan No cum LR No</label>
-            <input type="text" class="form-control bg-light fw-bold text-success"
-                   value="<?= htmlspecialchars($chl_no) ?>" readonly tabindex="-1"
+            <input type="text" name="manual_challan_no" class="form-control fw-bold text-success"
+                   value="<?= htmlspecialchars($chl_no) ?>"
                    style="letter-spacing:0.5px">
-            <?php if ($action == 'add'): ?>
-            <div class="form-text text-muted"><i class="bi bi-lock-fill me-1"></i>Auto-generated on save</div>
-            <?php endif; ?>
+            <div class="form-text text-muted"><i class="bi bi-pencil-fill me-1"></i>Edit if needed</div>
         </div>
         <div class="col-4 col-sm-3 col-md-2">
             <label class="form-label">Despatch Date *</label>
@@ -875,7 +923,7 @@ document.addEventListener('DOMContentLoaded', function(){
 
 
     <!-- Consignee -->
-    <div class="col-12 col-md-6 d-flex flex-column"><div class="card h-100"><div class="card-header d-flex justify-content-between align-items-center">
+    <div class="col-12 col-md-6 d-flex flex-column d-none"><div class="card h-100"><div class="card-header d-flex justify-content-between align-items-center">
         <span><i class="bi bi-geo-alt me-2"></i>Consignee Details</span>
         <span id="autofillBadge" class="badge bg-success d-none">
             <i class="bi bi-magic me-1"></i>Auto-filled from Vendor Ship-To
@@ -893,7 +941,7 @@ document.addEventListener('DOMContentLoaded', function(){
         </div>
         <div class="col-12">
             <label class="form-label">Consignee Name *</label>
-            <input type="text" name="consignee_name" id="consignee_name" class="form-control" required value="<?= htmlspecialchars($despatch['consignee_name']??'') ?>">
+            <input type="text" name="consignee_name" id="consignee_name" class="form-control" value="<?= htmlspecialchars($despatch['consignee_name']??'') ?>">
         </div>
         <div class="col-12">
             <label class="form-label">Address</label>
@@ -944,15 +992,15 @@ document.addEventListener('DOMContentLoaded', function(){
             <label class="form-label">Vehicle No *</label>
             <input type="text" name="vehicle_no" class="form-control" placeholder="MH-01-XX-1234" required value="<?= htmlspecialchars($despatch['vehicle_no']??'') ?>">
         </div>
-        <div class="col-12 col-sm-6 col-md-4">
+        <div class="col-12 col-sm-6 col-md-4 d-none">
             <label class="form-label">Driver Name</label>
             <input type="text" name="driver_name" class="form-control" value="<?= htmlspecialchars($despatch['driver_name']??'') ?>">
         </div>
-        <div class="col-12 col-sm-6 col-md-4">
+        <div class="col-12 col-sm-6 col-md-4 d-none">
             <label class="form-label">Driver Mobile</label>
             <input type="text" name="driver_mobile" class="form-control" value="<?= htmlspecialchars($despatch['driver_mobile']??'') ?>">
         </div>
-        <div class="col-6 col-sm-4 col-md-4">
+        <div class="col-6 col-sm-4 col-md-4 d-none">
             <label class="form-label">Received Weight</label>
             <input type="number" name="total_weight" id="totalWeightDisplay" step="0.001" class="form-control bg-light"
                    value="<?= $despatch['total_weight']??0 ?>" readonly tabindex="-1">
@@ -968,7 +1016,7 @@ document.addEventListener('DOMContentLoaded', function(){
             <div class="form-text" id="freightFormula"><span class="text-muted">Auto from rate card</span></div>
         </div>
 
-        <div class="col-6 col-sm-4 col-md-3">
+        <div class="col-6 col-sm-4 col-md-3 d-none">
             <label class="form-label">Freight Paid By</label>
             <select name="freight_paid_by" class="form-select">
                 <option value="Consignee" <?= ($despatch['freight_paid_by']??'Consignee')=='Consignee'?'selected':'' ?>>Consignee</option>
@@ -992,94 +1040,183 @@ document.addEventListener('DOMContentLoaded', function(){
     </div></div></div></div>
 
     <!-- Items -->
-    <div class="col-12"><div class="card"><div class="card-header d-flex justify-content-between">
+    <div class="col-12 col-md-6"><div class="card h-100"><div class="card-header d-flex justify-content-between">
         <span><i class="bi bi-list-ul me-2"></i>Despatch Items</span>
         <button type="button" class="btn btn-sm btn-light" onclick="addDRow()"><i class="bi bi-plus-circle me-1"></i>Add Item</button>
     </div>
-    <div class="card-body p-0"><div class="table-responsive">
-    <table class="table mb-0" id="dItemsTable">
-        <thead class="table-light"><tr>
-            <th>Item</th><th>Description</th><th>UOM</th>
-            <th>Despatched Qty <small class="text-muted fw-normal">(Ref)</small></th><th>PO Rate</th><th class="d-price-col">Unit Price</th><th class="d-price-col">GST%</th>
-            <th class="d-weight-col">Received Weight</th><th class="d-price-col">Total ₹</th><th></th>
-        </tr></thead>
-        <tbody id="dItemsBody">
-        <?php if (!empty($despatch_items)): foreach($despatch_items as $di): ?>
-        <tr>
-            <td><select name="item_id[]" class="form-select form-select-sm d-item-select" required onchange="dFillItem(this)">
-                <option value="">-- Select --</option>
-                <?php foreach($items_list as $il): ?>
-                <option value="<?= $il['id'] ?>" data-uom="<?= $il['uom'] ?>"
-                    <?= $di['item_id']==$il['id']?'selected':'' ?>><?= htmlspecialchars($il['item_code'].' - '.$il['item_name']) ?></option>
-                <?php endforeach; ?>
-            </select></td>
-            <td><input type="text" name="desc[]" class="form-control form-control-sm" value="<?= htmlspecialchars($di['description']??'') ?>"></td>
-            <td>
-                <input type="hidden" name="uom[]" class="d-uom-val" value="<?= htmlspecialchars($di['uom']) ?>">
-                <input type="text" class="form-control form-control-sm bg-light d-uom-display" value="<?= htmlspecialchars($di['uom']) ?>" readonly tabindex="-1">
-            </td>
-            <td><input type="number" name="qty[]" class="form-control form-control-sm" value="<?= ($di['qty'] > 0) ? $di['qty'] : '' ?>" step="0.01" placeholder="Optional"></td>
-            <td><?php
-                $po_rate = $despatch['po_id'] ? ($po_items_map[(int)$despatch['po_id']][(int)$di['item_id']] ?? '') : '';
-            ?><input type="text" class="form-control form-control-sm bg-light text-primary fw-semibold d-po-rate" value="<?= $po_rate !== '' ? '₹'.number_format((float)$po_rate,2) : '-' ?>" readonly tabindex="-1"></td>
-            <td class="d-price-col"><input type="number" name="unit_price[]" class="form-control form-control-sm d-unit-price" value="<?= $di['unit_price'] ?>" step="0.01" onchange="dCalcRow(this)"></td>
-            <td class="d-price-col"><input type="number" name="gst_rate[]" class="form-control form-control-sm" value="<?= $di['gst_rate'] ?>" step="0.01" onchange="dCalcRow(this)"></td>
-            <td class="d-weight-col"><input type="number" name="weight[]" class="form-control form-control-sm d-weight" value="<?= $di['weight'] ?>" step="0.001" onchange="dCalcRow(this)"></td>
-            <td class="d-price-col"><input type="text" name="total_price[]" class="form-control form-control-sm bg-light fw-semibold d-row-total" value="<?= number_format((float)$di['total_price'],2) ?>" readonly tabindex="-1"></td>
-            <td><button type="button" class="btn btn-sm btn-outline-danger" onclick="dRemove(this)"><i class="bi bi-x"></i></button></td>
-        </tr>
+    <div class="card-body">
+    <div id="dItemsBody">
+        <?php if (!empty($despatch_items)): foreach($despatch_items as $di):
+            $po_rate = $despatch['po_id'] ? ($po_items_map[(int)$despatch['po_id']][(int)$di['item_id']] ?? '') : '';
+        ?>
+        <div class="d-item-card border rounded p-3 mb-3 position-relative" style="background:#fafafa">
+            <button type="button" class="btn btn-sm btn-outline-danger position-absolute" style="top:8px;right:8px" onclick="dRemove(this)"><i class="bi bi-x"></i></button>
+            <div class="row g-2">
+                <div class="col-12">
+                    <label class="form-label fw-semibold mb-1">Item</label>
+                    <select name="item_id[]" class="form-select d-item-select" required onchange="dFillItem(this)">
+                        <option value="">-- Select Item --</option>
+                        <?php foreach($items_list as $il): ?>
+                        <option value="<?= $il['id'] ?>" data-uom="<?= $il['uom'] ?>"
+                            <?= $di['item_id']==$il['id']?'selected':'' ?>><?= htmlspecialchars($il['item_code'].' - '.$il['item_name']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <input type="hidden" name="desc[]" value="<?= htmlspecialchars($di['description']??'') ?>">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">UOM</label>
+                    <input type="hidden" name="uom[]" class="d-uom-val" value="<?= htmlspecialchars($di['uom']) ?>">
+                    <input type="text" class="form-control bg-light d-uom-display" value="<?= htmlspecialchars($di['uom']) ?>" readonly tabindex="-1">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">Qty <small class="text-muted">(Ref)</small></label>
+                    <input type="number" name="qty[]" class="form-control" value="<?= ($di['qty'] > 0) ? $di['qty'] : '' ?>" step="0.01" placeholder="Optional">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">PO Rate</label>
+                    <input type="text" class="form-control bg-light text-primary fw-semibold d-po-rate" value="<?= $po_rate !== '' ? '₹'.number_format((float)$po_rate,2) : '-' ?>" readonly tabindex="-1">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">Unit Price</label>
+                    <input type="number" name="unit_price[]" class="form-control d-unit-price" value="<?= $di['unit_price'] ?>" step="0.01" onchange="dCalcRow(this)">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">GST %</label>
+                    <input type="number" name="gst_rate[]" class="form-control" value="<?= $di['gst_rate'] ?>" step="0.01" onchange="dCalcRow(this)">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">Weight (MT)</label>
+                    <input type="number" name="weight[]" class="form-control d-weight" value="<?= $di['weight'] ?>" step="0.001" onchange="dCalcRow(this)">
+                </div>
+                <div class="col-12">
+                    <label class="form-label mb-1">Total ₹</label>
+                    <input type="text" name="total_price[]" class="form-control bg-light fw-bold text-success d-row-total" value="<?= number_format((float)$di['total_price'],2) ?>" readonly tabindex="-1">
+                </div>
+            </div>
+        </div>
         <?php endforeach; else: ?>
-        <tr>
-            <td><select name="item_id[]" class="form-select form-select-sm d-item-select" onchange="dFillItem(this)">
-                <option value="">-- Select --</option>
-                <?php foreach($items_list as $il): ?>
-                <option value="<?= $il['id'] ?>" data-uom="<?= $il['uom'] ?>"><?= htmlspecialchars($il['item_code'].' - '.$il['item_name']) ?></option>
-                <?php endforeach; ?>
-            </select></td>
-            <td><input type="text" name="desc[]" class="form-control form-control-sm"></td>
-            <td>
-                <input type="hidden" name="uom[]" class="d-uom-val">
-                <input type="text" class="form-control form-control-sm bg-light d-uom-display" readonly tabindex="-1">
-            </td>
-            <td><input type="number" name="qty[]" class="form-control form-control-sm" step="0.01" placeholder="Optional"></td>
-            <td><input type="text" class="form-control form-control-sm bg-light text-primary fw-semibold d-po-rate" value="-" readonly tabindex="-1"></td>
-            <td class="d-price-col"><input type="number" name="unit_price[]" class="form-control form-control-sm d-unit-price" step="0.01" onchange="dCalcRow(this)"></td>
-            <td class="d-price-col"><input type="number" name="gst_rate[]" class="form-control form-control-sm" step="0.01" onchange="dCalcRow(this)"></td>
-            <td class="d-weight-col"><input type="number" name="weight[]" class="form-control form-control-sm d-weight" step="0.001" value="0" onchange="dCalcRow(this)"></td>
-            <td class="d-price-col"><input type="text" name="total_price[]" class="form-control form-control-sm bg-light fw-semibold d-row-total" value="0.00" readonly tabindex="-1"></td>
-            <td><button type="button" class="btn btn-sm btn-outline-danger" onclick="dRemove(this)"><i class="bi bi-x"></i></button></td>
-        </tr>
+        <div class="d-item-card border rounded p-3 mb-3 position-relative" style="background:#fafafa">
+            <button type="button" class="btn btn-sm btn-outline-danger position-absolute" style="top:8px;right:8px" onclick="dRemove(this)"><i class="bi bi-x"></i></button>
+            <div class="row g-2">
+                <div class="col-12">
+                    <label class="form-label fw-semibold mb-1">Item</label>
+                    <select name="item_id[]" class="form-select d-item-select" onchange="dFillItem(this)">
+                        <option value="">-- Select Item --</option>
+                        <?php foreach($items_list as $il): ?>
+                        <option value="<?= $il['id'] ?>" data-uom="<?= $il['uom'] ?>"><?= htmlspecialchars($il['item_code'].' - '.$il['item_name']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <input type="hidden" name="desc[]" value="">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">UOM</label>
+                    <input type="hidden" name="uom[]" class="d-uom-val">
+                    <input type="text" class="form-control bg-light d-uom-display" readonly tabindex="-1">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">Qty <small class="text-muted">(Ref)</small></label>
+                    <input type="number" name="qty[]" class="form-control" step="0.01" placeholder="Optional">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">PO Rate</label>
+                    <input type="text" class="form-control bg-light text-primary fw-semibold d-po-rate" value="-" readonly tabindex="-1">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">Unit Price</label>
+                    <input type="number" name="unit_price[]" class="form-control d-unit-price" step="0.01" onchange="dCalcRow(this)">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">GST %</label>
+                    <input type="number" name="gst_rate[]" class="form-control" step="0.01" onchange="dCalcRow(this)">
+                </div>
+                <div class="col-4">
+                    <label class="form-label mb-1">Weight (MT)</label>
+                    <input type="number" name="weight[]" class="form-control d-weight" step="0.001" value="0" onchange="dCalcRow(this)">
+                </div>
+                <div class="col-12">
+                    <label class="form-label mb-1">Total ₹</label>
+                    <input type="text" name="total_price[]" class="form-control bg-light fw-bold text-success d-row-total" value="0.00" readonly tabindex="-1">
+                </div>
+            </div>
+        </div>
         <?php endif; ?>
-        </tbody>
-        <tfoot class="table-light">
-            <tr><td colspan="8" class="text-end fw-bold">Grand Total (incl. GST):</td><td colspan="2"><strong id="dGrandTotal">₹0.00</strong></td></tr>
-        </tfoot>
-    </table>
-    <!-- Hidden template row for JS cloning (disabled so not submitted) -->
-    <table id="dRowTemplate" style="display:none">
-    <tbody><tr>
-        <td><select class="form-select form-select-sm d-item-select" disabled>
-            <option value="">-- Select --</option>
-            <?php foreach($items_list as $il): ?>
-            <option value="<?= $il['id'] ?>" data-uom="<?= $il['uom'] ?>"><?= htmlspecialchars($il['item_code'].' - '.$il['item_name']) ?></option>
-            <?php endforeach; ?>
-        </select></td>
-        <td><input type="text" class="form-control form-control-sm" disabled></td>
-        <td>
-            <input type="text" class="d-uom-val" style="display:none" disabled>
-            <input type="text" class="form-control form-control-sm bg-light d-uom-display" readonly tabindex="-1" disabled>
-        </td>
-        <td><input type="number" class="form-control form-control-sm" step="0.001" placeholder="Optional" disabled></td>
-        <td><input type="text" class="form-control form-control-sm bg-light text-primary fw-semibold d-po-rate" value="-" readonly tabindex="-1" disabled></td>
-        <td class="d-price-col"><input type="number" class="form-control form-control-sm d-unit-price" step="0.01" disabled></td>
-        <td class="d-price-col"><input type="number" class="form-control form-control-sm" step="0.01" disabled></td>
-        <td class="d-weight-col"><input type="number" class="form-control form-control-sm d-weight" step="0.001" value="0" disabled></td>
-        <td class="d-price-col"><input type="text" class="form-control form-control-sm d-row-total" readonly disabled></td>
-        <td><button type="button" class="btn btn-sm btn-outline-danger"><i class="bi bi-x"></i></button></td>
-    </tr></tbody>
-    </table>
-    </div></div></div></div>
+    </div>
+    <div class="d-flex justify-content-between align-items-center mt-3 px-1">
+        <strong>Grand Total (incl. GST):</strong>
+        <strong id="dGrandTotal" class="text-success fs-5">₹0.00</strong>
+    </div>
+    <!-- Hidden template for JS cloning -->
+    <div id="dRowTemplate" style="display:none">
+    <div class="d-item-card border rounded p-3 mb-3 position-relative" style="background:#fafafa">
+        <button type="button" class="btn btn-sm btn-outline-danger position-absolute" style="top:8px;right:8px"><i class="bi bi-x"></i></button>
+        <div class="row g-2">
+            <div class="col-12">
+                <label class="form-label fw-semibold mb-1">Item</label>
+                <select class="form-select d-item-select" disabled>
+                    <option value="">-- Select Item --</option>
+                    <?php foreach($items_list as $il): ?>
+                    <option value="<?= $il['id'] ?>" data-uom="<?= $il['uom'] ?>"><?= htmlspecialchars($il['item_code'].' - '.$il['item_name']) ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <input type="hidden" class="d-desc-val" disabled>
+            </div>
+            <div class="col-4">
+                <label class="form-label mb-1">UOM</label>
+                <input type="hidden" class="d-uom-val" disabled>
+                <input type="text" class="form-control bg-light d-uom-display" readonly tabindex="-1" disabled>
+            </div>
+            <div class="col-4">
+                <label class="form-label mb-1">Qty <small class="text-muted">(Ref)</small></label>
+                <input type="number" class="form-control" step="0.01" placeholder="Optional" disabled>
+            </div>
+            <div class="col-4">
+                <label class="form-label mb-1">PO Rate</label>
+                <input type="text" class="form-control bg-light text-primary fw-semibold d-po-rate" value="-" readonly tabindex="-1" disabled>
+            </div>
+            <div class="col-4">
+                <label class="form-label mb-1">Unit Price</label>
+                <input type="number" class="form-control d-unit-price" step="0.01" disabled>
+            </div>
+            <div class="col-4">
+                <label class="form-label mb-1">GST %</label>
+                <input type="number" class="form-control" step="0.01" disabled>
+            </div>
+            <div class="col-4">
+                <label class="form-label mb-1">Weight (MT)</label>
+                <input type="number" class="form-control d-weight" step="0.001" value="0" disabled>
+            </div>
+            <div class="col-12">
+                <label class="form-label mb-1">Total ₹</label>
+                <input type="text" class="form-control bg-light fw-bold text-success d-row-total" value="0.00" readonly tabindex="-1" disabled>
+            </div>
+        </div>
+    </div>
+    </div>
+    </div></div></div>
 
+<style>
+@media (min-width: 768px) {
+    #despatchForm .form-control,
+    #despatchForm .form-select {
+        font-size: .82rem;
+        padding: .25rem .5rem;
+    }
+    #despatchForm .form-label {
+        font-size: .78rem;
+        margin-bottom: .15rem;
+    }
+    #despatchForm .input-group-text {
+        font-size: .82rem;
+        padding: .25rem .5rem;
+    }
+    #despatchForm .d-item-card {
+        padding: .6rem !important;
+    }
+    #despatchForm .d-item-card .row {
+        --bs-gutter-y: .3rem;
+    }
+}
+</style>
     <!-- MTC Section -->
     <div class="col-12">
     <div class="card border-warning">
@@ -1621,34 +1758,44 @@ function renderPOBalance(poId) {
         wrap.style.display = 'none';
         return;
     }
-    var rows = '';
     var allFulfilled = true;
+    var rows = '';
+    var cards = '';
     Object.values(items).forEach(function(it) {
         var bal = parseFloat(it.balance) || 0;
         var pct = it.po_qty > 0 ? Math.min(100, Math.round((it.despatched / it.po_qty) * 100)) : 0;
         var badgeCls = bal <= 0 ? 'bg-success' : (pct >= 50 ? 'bg-warning text-dark' : 'bg-danger');
         var balLbl   = bal <= 0 ? 'Fulfilled' : bal.toFixed(3) + ' pending';
         if (bal > 0) allFulfilled = false;
+        // Table row (desktop)
         rows += '<tr>'
             + '<td class="py-1">' + it.item_name + '</td>'
             + '<td class="text-end py-1">' + parseFloat(it.po_qty).toFixed(3) + '</td>'
             + '<td class="text-end py-1 text-success">' + parseFloat(it.despatched).toFixed(3) + '</td>'
             + '<td class="text-end py-1 fw-bold ' + (bal > 0 ? 'text-danger' : 'text-success') + '">' + (bal > 0 ? bal.toFixed(3) : '0.000') + '</td>'
-            + '<td class="py-1" style="min-width:120px">'
-            +   '<div class="progress" style="height:14px">'
-            +     '<div class="progress-bar ' + badgeCls + '" style="width:' + pct + '%">' + (pct > 15 ? pct + '%' : '') + '</div>'
-            +   '</div>'
-            + '</td>'
+            + '<td class="py-1" style="min-width:120px"><div class="progress" style="height:14px"><div class="progress-bar ' + badgeCls + '" style="width:' + pct + '%">' + (pct > 15 ? pct + '%' : '') + '</div></div></td>'
             + '<td class="py-1"><span class="badge ' + badgeCls + '">' + balLbl + '</span></td>'
             + '</tr>';
+        // Card (mobile)
+        cards += '<div class="border rounded p-2 mb-2">'
+            + '<div class="fw-semibold mb-1">' + it.item_name + '</div>'
+            + '<div class="d-flex justify-content-between mb-1"><span class="text-muted">PO Qty</span><span>' + parseFloat(it.po_qty).toFixed(3) + '</span></div>'
+            + '<div class="d-flex justify-content-between mb-1"><span class="text-muted">Despatched</span><span class="text-success">' + parseFloat(it.despatched).toFixed(3) + '</span></div>'
+            + '<div class="d-flex justify-content-between mb-2"><span class="text-muted">Balance</span><span class="fw-bold ' + (bal > 0 ? 'text-danger' : 'text-success') + '">' + (bal > 0 ? bal.toFixed(3) : '0.000') + '</span></div>'
+            + '<div class="progress mb-1" style="height:10px"><div class="progress-bar ' + badgeCls + '" style="width:' + pct + '%"></div></div>'
+            + '<span class="badge ' + badgeCls + '">' + balLbl + '</span>'
+            + '</div>';
     });
-    table.innerHTML = '<table class="table table-sm table-bordered mb-0">'
+    var fulfilled_row = allFulfilled ? '<div class="text-center text-success py-1 fw-semibold"><i class="bi bi-check-circle-fill me-1"></i>All PO quantities fulfilled</div>' : '';
+    table.innerHTML =
+        // Desktop table
+        '<div class="d-none d-md-block"><table class="table table-sm table-bordered mb-0">'
         + '<thead class="table-primary"><tr>'
         + '<th>Item</th><th class="text-end">PO Qty</th><th class="text-end">Despatched</th>'
         + '<th class="text-end">Balance</th><th>Progress</th><th>Status</th>'
-        + '</tr></thead><tbody>' + rows + '</tbody>'
-        + (allFulfilled ? '<tfoot><tr><td colspan="6" class="text-center text-success py-1 fw-semibold"><i class="bi bi-check-circle-fill me-1"></i>All PO quantities fulfilled</td></tr></tfoot>' : '')
-        + '</table>';
+        + '</tr></thead><tbody>' + rows + '</tbody></table>' + fulfilled_row + '</div>'
+        // Mobile cards
+        + '<div class="d-md-none">' + cards + fulfilled_row + '</div>';
     wrap.style.display = 'block';
 }
 
@@ -1658,7 +1805,7 @@ function applyPOItemPrices(poId) {
     var gstMap      = poGstMap[poId]   || {};
     var statusSel   = document.querySelector('[name="status"]');
     var isDelivered = statusSel && statusSel.value === 'Delivered';
-    document.querySelectorAll('#dItemsBody > tr').forEach(function(row) {
+    document.querySelectorAll('#dItemsBody .d-item-card').forEach(function(row) {
         var selEl   = row.querySelector('[name="item_id[]"]');
         var priceEl = row.querySelector('[name="unit_price[]"]');
         var gstEl   = row.querySelector('[name="gst_rate[]"]');
@@ -1909,14 +2056,7 @@ function onStatusChange(sel) {
     var fiSec = document.getElementById('freightInvoiceSection');
     if (fiSec) fiSec.style.display = delivered ? 'block' : 'none';
     if (delivered) toggleHardCopy();
-    // Show/hide price columns based on Delivered status
-    document.querySelectorAll('.d-price-col').forEach(function(el) {
-        el.style.display = delivered ? '' : 'none';
-    });
-    // Show/hide Received Weight column based on Delivered status
-    document.querySelectorAll('.d-weight-col').forEach(function(el) {
-        el.style.display = delivered ? '' : 'none';
-    });
+    // Card layout: all fields always visible - no column toggling needed
     // Auto-populate price fields when switching to Delivered
     if (delivered) {
         var poSel = document.getElementById('poRefSelect');
@@ -1984,7 +2124,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <?php endif; ?>
 
     // Wire all pre-rendered item rows (edit mode)
-    document.querySelectorAll('#dItemsBody > tr').forEach(function(row) { wireRow(row); });
+    document.querySelectorAll('#dItemsBody .d-item-card').forEach(function(row) { wireRow(row); });
 
     var vSel = document.getElementById('vendorSelect');
     if (vSel && vSel.value) filterPOByVendor(vSel.value);
@@ -2054,28 +2194,15 @@ document.addEventListener('DOMContentLoaded', function() {
 
 /* ── Items table functions ──────────────────────────────── */
 function makeNewRow() {
-    var tpl = document.querySelector('#dRowTemplate tbody tr');
+    var tpl = document.querySelector('#dRowTemplate .d-item-card');
     var row = tpl.cloneNode(true);
 
     // Re-enable all inputs and assign proper name attributes
     var itemSel = row.querySelector('.d-item-select');
     if (itemSel) { itemSel.removeAttribute('disabled'); itemSel.name = 'item_id[]'; }
 
-    var inputs = row.querySelectorAll('input');
-    var nameMap = [
-        [1, 'desc[]'],
-        [3, 'qty[]'],
-        [5, 'unit_price[]'],
-        [6, 'gst_rate[]'],
-        [7, 'weight[]'],
-        [8, 'total_price[]']
-    ];
-    // Re-enable by class/position
     row.querySelectorAll('.d-uom-val').forEach(function(el) {
-        el.removeAttribute('disabled');
-        el.name = 'uom[]';
-        el.type = 'hidden';
-        el.style.display = '';
+        el.removeAttribute('disabled'); el.name = 'uom[]';
     });
     row.querySelectorAll('.d-uom-display').forEach(function(el) { el.removeAttribute('disabled'); });
     row.querySelectorAll('.d-unit-price').forEach(function(el) { el.removeAttribute('disabled'); el.name = 'unit_price[]'; });
@@ -2083,24 +2210,25 @@ function makeNewRow() {
     row.querySelectorAll('.d-row-total').forEach(function(el) { el.removeAttribute('disabled'); el.name = 'total_price[]'; });
     row.querySelectorAll('.d-po-rate').forEach(function(el) { el.removeAttribute('disabled'); });
 
-    // Re-enable remaining inputs by td position
-    var tds = row.querySelectorAll('td');
-    // td[1]=desc, td[3]=qty, td[6]=gst_rate
-    if (tds[1]) { var inp = tds[1].querySelector('input'); if (inp) { inp.removeAttribute('disabled'); inp.name = 'desc[]'; } }
-    if (tds[3]) { var inp = tds[3].querySelector('input'); if (inp) { inp.removeAttribute('disabled'); inp.name = 'qty[]'; } }
-    if (tds[6]) { var inp = tds[6].querySelector('input'); if (inp) { inp.removeAttribute('disabled'); inp.name = 'gst_rate[]'; } }
+    // desc hidden, qty, gst_rate
+    var descInp = row.querySelector('.d-desc-val');
+    if (descInp) { descInp.removeAttribute('disabled'); descInp.name = 'desc[]'; }
+    row.querySelectorAll('input[type="number"]').forEach(function(el) {
+        if (!el.name && !el.disabled) return;
+        el.removeAttribute('disabled');
+        if (el.classList.contains('d-unit-price')) el.name = 'unit_price[]';
+        else if (el.classList.contains('d-weight')) el.name = 'weight[]';
+    });
+    // qty and gst by label
+    row.querySelectorAll('input[type="number"]').forEach(function(el) {
+        var lbl = el.closest('.col-4, .col-12');
+        if (!lbl) return;
+        var ltext = lbl.querySelector('label') ? lbl.querySelector('label').textContent : '';
+        if (ltext.includes('Qty')) { el.removeAttribute('disabled'); el.name = 'qty[]'; }
+        if (ltext.includes('GST')) { el.removeAttribute('disabled'); el.name = 'gst_rate[]'; }
+    });
 
     wireRow(row);
-
-    // Hide price cols and weight col if not delivered
-    var statusSel = document.querySelector('[name="status"]');
-    var isDeliv = statusSel && statusSel.value === 'Delivered';
-    row.querySelectorAll('.d-price-col').forEach(function(td) {
-        td.style.display = isDeliv ? '' : 'none';
-    });
-    row.querySelectorAll('.d-weight-col').forEach(function(td) {
-        td.style.display = isDeliv ? '' : 'none';
-    });
     return row;
 }
 function wireRow(row) {
@@ -2113,16 +2241,19 @@ function wireRow(row) {
     if (btn) btn.onclick = function() { dRemove(this); };
 }
 function addDRow() {
-    var tbody = document.getElementById('dItemsBody');
-    tbody.appendChild(makeNewRow());
+    var body = document.getElementById('dItemsBody');
+    // Insert before grand total line (last 2 children are total + template)
+    body.insertBefore(makeNewRow(), body.lastElementChild.previousElementSibling || body.lastElementChild);
+    dCalcTotal();
 }
 function dRemove(btn) {
-    if (document.getElementById('dItemsBody').rows.length > 1) btn.closest('tr').remove();
+    var body = document.getElementById('dItemsBody');
+    if (body.querySelectorAll('.d-item-card').length > 1) btn.closest('.d-item-card').remove();
     dCalcTotal();
     dUpdateWeightAndFreight();
 }
 function dFillItem(sel) {
-    var row = sel.closest('tr');
+    var row = sel.closest('.d-item-card');
     var opt = sel.selectedOptions[0];
     if (!opt || !opt.value) return;
     var uomVal  = row.querySelector('.d-uom-val');
@@ -2156,7 +2287,7 @@ function dFillItem(sel) {
 }
 function dCalcRow(el) {
     if (!el) return;
-    var row    = el.closest('tr');
+    var row    = el.closest('.d-item-card');
     var price  = parseFloat(row.querySelector('[name="unit_price[]"]')?.value) || 0;
     var weight = parseFloat(row.querySelector('[name="weight[]"]')?.value)     || 0;
     var gst    = parseFloat(row.querySelector('[name="gst_rate[]"]')?.value)   || 0;

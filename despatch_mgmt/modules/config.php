@@ -289,11 +289,7 @@ function canViewAll(string $module): bool {
     $db  = getDB();
     $uid = (int)($_SESSION['user_id'] ?? 0);
     if (!$uid) return false;
-    $col = match($module) {
-        'trips'    => 'view_all_trips',
-        'challans' => 'view_all_challans',
-        default    => 'view_all_despatch',
-    };
+    $col = $module === 'trips' ? 'view_all_trips' : 'view_all_despatch';
     $row = $db->query("SELECT `$col` FROM app_users WHERE id=$uid LIMIT 1")->fetch_assoc();
     return (bool)($row[$col] ?? false);
 }
